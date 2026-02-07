@@ -3,12 +3,15 @@ import logging
 import asyncio
 import re
 import io
+import json
 import psycopg2
 import psycopg2.extras
-from typing import Dict, List
+import httpx
+from urllib.parse import quote
+from typing import Dict, List, Optional
 from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, ContextTypes
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
@@ -18,6 +21,21 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 netflix_sessions: Dict[int, dict] = {}
+
+CHROME_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--no-first-run",
+    "--disable-blink-features=AutomationControlled",
+]
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 
 def get_db():
@@ -47,6 +65,7 @@ class NetflixBrowser:
         self.cookies = self._parse_cookies_for_playwright(cookies)
         self.http_cookies = self._parse_cookies_for_http(cookies)
         self.profiles_cache: List[dict] = []
+        self.build_id: Optional[str] = None
 
     def _parse_cookies_for_playwright(self, cookie_str: str) -> list:
         cookies = []
@@ -71,105 +90,151 @@ class NetflixBrowser:
                 cookies[key.strip()] = value.strip()
         return cookies
 
+    async def _launch_browser(self) -> tuple:
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(
+            headless=True,
+            args=CHROME_ARGS
+        )
+        context = await browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 900},
+            locale="en-US"
+        )
+        await context.add_cookies(self.cookies)
+        return p, browser, context
+
+    async def _safe_close(self, p=None, browser=None):
+        try:
+            if browser:
+                await browser.close()
+        except:
+            pass
+        try:
+            if p:
+                await p.stop()
+        except:
+            pass
+
     @staticmethod
     async def login_with_credentials(email: str, password: str) -> tuple:
+        p = None
+        browser = None
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    viewport={"width": 1280, "height": 900}
-                )
-                page = await context.new_page()
+            p = await async_playwright().start()
+            browser = await p.chromium.launch(headless=True, args=CHROME_ARGS)
+            context = await browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 900}
+            )
+            page = await context.new_page()
 
-                await page.goto("https://www.netflix.com/login")
+            await page.goto("https://www.netflix.com/login", wait_until="domcontentloaded")
+            await page.wait_for_timeout(3000)
+
+            if "login" not in page.url.lower():
+                await browser.close()
+                await p.stop()
+                return False, "Could not reach login page", ""
+
+            email_input = page.locator("input[name='userLoginId']").first
+            if await email_input.count() == 0:
+                email_input = page.locator("input[type='email']").first
+            if await email_input.count() == 0:
+                await browser.close()
+                await p.stop()
+                return False, "Email input not found", ""
+
+            await email_input.click()
+            await page.keyboard.type(email, delay=30)
+            await page.wait_for_timeout(500)
+
+            continue_btn = page.locator("button[type='submit']").first
+            if await continue_btn.count() > 0:
+                await continue_btn.click()
                 await page.wait_for_timeout(3000)
 
-                if "login" not in page.url.lower():
-                    await browser.close()
-                    return False, "Could not reach login page", ""
+            pwd_input = page.locator("input[name='password'], input[type='password']").first
+            for _ in range(5):
+                if await pwd_input.count() > 0:
+                    break
+                await page.wait_for_timeout(1000)
 
-                email_input = page.locator("input[name='userLoginId']").first
-                if await email_input.count() == 0:
-                    await browser.close()
-                    return False, "Email input not found", ""
-
-                await email_input.click()
-                await page.keyboard.type(email, delay=30)
-                await page.wait_for_timeout(500)
-
-                continue_btn = page.locator("button[type='submit']").first
-                if await continue_btn.count() > 0:
-                    await continue_btn.click()
-                    await page.wait_for_timeout(3000)
-
-                pwd_input = page.locator("input[name='password'], input[type='password']").first
-
-                for _ in range(5):
-                    if await pwd_input.count() > 0:
-                        break
-                    await page.wait_for_timeout(1000)
-
-                if await pwd_input.count() == 0:
-                    await browser.close()
-                    return False, "Password input not found", ""
-
-                await pwd_input.click()
-                await page.keyboard.type(password, delay=30)
-                await page.wait_for_timeout(500)
-
-                sign_in_btn = page.locator("button[type='submit']").first
-                if await sign_in_btn.count() > 0:
-                    await sign_in_btn.click()
-                else:
-                    await page.keyboard.press("Enter")
-
-                await page.wait_for_timeout(6000)
-
-                error_msg = page.locator("[data-uia='error-message-container'], .ui-message-contents, [data-uia='text']").first
-                if await error_msg.count() > 0:
-                    error_text = await error_msg.text_content()
-                    if error_text and ("incorrect" in error_text.lower() or "wrong" in error_text.lower() or "invalid" in error_text.lower()):
-                        await browser.close()
-                        return False, f"Login failed: {error_text}", ""
-
-                current_url = page.url.lower()
-                if "login" in current_url and "browse" not in current_url and "profile" not in current_url:
-                    await page.wait_for_timeout(2000)
-                    current_url = page.url.lower()
-                    if "login" in current_url:
-                        await browser.close()
-                        return False, "Login failed - check credentials", ""
-
-                if "browse" in current_url or "profile" in current_url:
-                    cookies = await context.cookies()
-                    cookie_parts = []
-                    for cookie in cookies:
-                        if cookie["name"] in ["NetflixId", "SecureNetflixId"]:
-                            cookie_parts.append(f"{cookie['name']}={cookie['value']}")
-
-                    if len(cookie_parts) >= 2:
-                        cookie_string = "; ".join(cookie_parts)
-                        await browser.close()
-                        return True, "Login successful!", cookie_string
-                    else:
-                        await browser.close()
-                        return False, "Could not extract session cookies", ""
-
+            if await pwd_input.count() == 0:
                 await browser.close()
-                return False, f"Login failed - unexpected page: {page.url}", ""
+                await p.stop()
+                return False, "Password input not found", ""
+
+            await pwd_input.click()
+            await page.keyboard.type(password, delay=30)
+            await page.wait_for_timeout(500)
+
+            sign_in_btn = page.locator("button[type='submit']").first
+            if await sign_in_btn.count() > 0:
+                await sign_in_btn.click()
+            else:
+                await page.keyboard.press("Enter")
+
+            await page.wait_for_timeout(6000)
+
+            error_msg = page.locator("[data-uia='error-message-container'], .ui-message-contents, [data-uia='text']").first
+            if await error_msg.count() > 0:
+                error_text = await error_msg.text_content()
+                if error_text and any(w in error_text.lower() for w in ["incorrect", "wrong", "invalid"]):
+                    await browser.close()
+                    await p.stop()
+                    return False, f"Login failed: {error_text}", ""
+
+            current_url = page.url.lower()
+            if "login" in current_url and "browse" not in current_url and "profile" not in current_url:
+                await page.wait_for_timeout(2000)
+                current_url = page.url.lower()
+                if "login" in current_url:
+                    await browser.close()
+                    await p.stop()
+                    return False, "Login failed - check credentials", ""
+
+            if "browse" in current_url or "profile" in current_url:
+                cookies = await context.cookies()
+                cookie_parts = []
+                for cookie in cookies:
+                    if cookie["name"] in ["NetflixId", "SecureNetflixId"]:
+                        cookie_parts.append(f"{cookie['name']}={cookie['value']}")
+
+                if len(cookie_parts) >= 2:
+                    cookie_string = "; ".join(cookie_parts)
+                    await browser.close()
+                    await p.stop()
+                    return True, "Login successful!", cookie_string
+                else:
+                    await browser.close()
+                    await p.stop()
+                    return False, "Could not extract session cookies", ""
+
+            await browser.close()
+            await p.stop()
+            return False, f"Login failed - unexpected page: {page.url}", ""
 
         except Exception as e:
+            if browser:
+                try:
+                    await browser.close()
+                except:
+                    pass
+            if p:
+                try:
+                    await p.stop()
+                except:
+                    pass
             return False, f"Error: {str(e)}", ""
 
     async def validate_session(self) -> tuple:
         try:
-            import httpx
             async with httpx.AsyncClient(
                 cookies=self.http_cookies,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                headers={"User-Agent": USER_AGENT},
                 follow_redirects=True,
-                timeout=10.0
+                timeout=15.0
             ) as client:
                 response = await client.get("https://www.netflix.com/browse")
 
@@ -183,14 +248,26 @@ class NetflixBrowser:
         except Exception as e:
             return False, f"Error: {str(e)}"
 
+    async def _extract_build_id(self, content: str) -> Optional[str]:
+        patterns = [
+            r'"BUILD_IDENTIFIER"\s*:\s*"([^"]+)"',
+            r'buildIdentifier"\s*:\s*"([^"]+)"',
+            r'/nf/([a-f0-9]+)/',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, content)
+            if match:
+                self.build_id = match.group(1)
+                return self.build_id
+        return None
+
     async def get_profiles(self) -> tuple:
         try:
-            import httpx
             async with httpx.AsyncClient(
                 cookies=self.http_cookies,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                headers={"User-Agent": USER_AGENT},
                 follow_redirects=True,
-                timeout=10.0
+                timeout=15.0
             ) as client:
                 response = await client.get("https://www.netflix.com/ManageProfiles")
 
@@ -198,31 +275,50 @@ class NetflixBrowser:
                     return False, "Session expired"
 
                 content = response.text
+                await self._extract_build_id(content)
+
                 profiles = []
                 seen_guids = set()
 
-                profile_pattern = r'"([A-Z0-9]{20,})"\s*:\s*\{[^}]*"profileName"\s*:\s*"([^"]+)"[^}]*"isKids"\s*:\s*(true|false)'
-                matches = re.findall(profile_pattern, content)
+                pattern1 = r'"guid"\s*:\s*"([^"]+)"[^}]*?"profileName"\s*:\s*"([^"]+)"'
+                pattern2 = r'"([A-Z0-9]{20,})"\s*:\s*\{[^}]*"profileName"\s*:\s*"([^"]+)"'
+                pattern3 = r'"profileName"\s*:\s*"([^"]+)"[^}]*?"guid"\s*:\s*"([^"]+)"'
 
-                if not matches:
-                    guid_name_pairs = re.findall(r'"([A-Z0-9]{20,})"\s*:\s*\{[^}]*"profileName"\s*:\s*"([^"]+)"', content)
-                    for guid, name in guid_name_pairs:
+                matches1 = re.findall(pattern1, content)
+                for guid, name in matches1:
+                    if guid not in seen_guids and len(guid) > 10:
+                        seen_guids.add(guid)
+                        try:
+                            name = name.encode('latin-1').decode('unicode_escape')
+                        except:
+                            pass
+                        profiles.append({
+                            "guid": guid,
+                            "profileName": name,
+                            "isKids": False,
+                            "isLocked": False
+                        })
+
+                if not profiles:
+                    matches2 = re.findall(pattern2, content)
+                    for guid, name in matches2:
                         if guid not in seen_guids:
                             seen_guids.add(guid)
                             try:
                                 name = name.encode('latin-1').decode('unicode_escape')
                             except:
                                 pass
-                            is_kids = name.lower() in ['kids', 'children']
                             profiles.append({
                                 "guid": guid,
                                 "profileName": name,
-                                "isKids": is_kids,
+                                "isKids": False,
                                 "isLocked": False
                             })
-                else:
-                    for guid, name, is_kids_str in matches:
-                        if guid not in seen_guids:
+
+                if not profiles:
+                    matches3 = re.findall(pattern3, content)
+                    for name, guid in matches3:
+                        if guid not in seen_guids and len(guid) > 10:
                             seen_guids.add(guid)
                             try:
                                 name = name.encode('latin-1').decode('unicode_escape')
@@ -231,75 +327,172 @@ class NetflixBrowser:
                             profiles.append({
                                 "guid": guid,
                                 "profileName": name,
-                                "isKids": is_kids_str.lower() == 'true',
+                                "isKids": False,
                                 "isLocked": False
                             })
+
+                kids_pattern = r'"isKids"\s*:\s*true[^}]*"guid"\s*:\s*"([^"]+)"'
+                kids_pattern2 = r'"guid"\s*:\s*"([^"]+)"[^}]*"isKids"\s*:\s*true'
+                kids_guids = set()
+                for pattern in [kids_pattern, kids_pattern2]:
+                    for match in re.findall(pattern, content):
+                        kids_guids.add(match)
+
+                for profile in profiles:
+                    if profile["guid"] in kids_guids:
+                        profile["isKids"] = True
 
                 self.profiles_cache = profiles
+                logger.info(f"Found {len(profiles)} profiles")
                 return True, {"profiles": profiles}
 
         except Exception as e:
+            logger.error(f"Get profiles error: {e}")
             return False, f"Error: {str(e)}"
 
-    async def _update_profile_on_page(self, page, guid: str, new_name: str, index: int) -> dict:
+    async def _update_profile_on_page(self, page: Page, guid: str, new_name: str, index: int) -> dict:
         try:
-            await page.goto(f"https://www.netflix.com/settings/{guid}")
-            await page.wait_for_load_state("domcontentloaded")
-            await page.wait_for_timeout(1200)
-
-            if "login" in page.url.lower():
-                return {"index": index, "success": False, "error": "Session expired"}
-
-            name_button = page.locator("button:has-text('Edit personal and contact info')").first
-            if await name_button.count() == 0:
-                return {"index": index, "success": False, "error": "Edit button not found"}
-
-            await name_button.click(force=True)
-            await page.wait_for_timeout(1200)
-
-            name_input = page.locator("input[name='profile-name']")
-            if await name_input.count() == 0:
-                return {"index": index, "success": False, "error": "Name input not found"}
-
-            await name_input.click()
-            await name_input.press("Control+a")
-            await name_input.fill(new_name)
-            await page.wait_for_timeout(200)
-
-            save_btn = page.locator("button:has-text('Save')").first
-            if await save_btn.count() > 0:
-                await save_btn.click(force=True)
-                await page.wait_for_timeout(1000)
-
-            return {"index": index, "success": True, "new_name": new_name}
-
+            return await asyncio.wait_for(
+                self._do_update_profile(page, guid, new_name, index),
+                timeout=45.0
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[{index}] Profile update timed out for {guid}")
+            return {"index": index, "success": False, "error": "Timed out after 45s"}
         except Exception as e:
+            logger.error(f"[{index}] Update profile error: {e}")
             return {"index": index, "success": False, "error": str(e)}
 
-    async def _update_single_profile(self, guid: str, new_name: str, index: int) -> dict:
+    async def _do_update_profile(self, page: Page, guid: str, new_name: str, index: int) -> dict:
+        logger.info(f"[{index}] Updating profile: {guid} -> {new_name}")
+
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    viewport={"width": 1280, "height": 900}
+            await page.goto(
+                f"https://www.netflix.com/settings/manage/profile/{guid}",
+                wait_until="domcontentloaded",
+                timeout=15000
+            )
+        except Exception:
+            logger.info(f"[{index}] /settings/manage/profile/ failed, trying /settings/")
+            try:
+                await page.goto(
+                    f"https://www.netflix.com/settings/{guid}",
+                    wait_until="domcontentloaded",
+                    timeout=15000
                 )
-                await context.add_cookies(self.cookies)
-                page = await context.new_page()
-                result = await self._update_profile_on_page(page, guid, new_name, index)
-                await browser.close()
-                return result
+            except Exception as nav_err:
+                return {"index": index, "success": False, "error": f"Navigation failed: {nav_err}"}
+
+        await page.wait_for_timeout(2000)
+
+        if "login" in page.url.lower():
+            return {"index": index, "success": False, "error": "Session expired"}
+
+        all_inputs = await page.locator("input:visible").all()
+        logger.info(f"[{index}] Page URL: {page.url}, visible inputs: {len(all_inputs)}")
+
+        name_selectors = [
+            "input[data-uia='profile-name-entry']",
+            "input#profile-name-entry",
+            "input[name='profileName']",
+            "input[name='profile-name']",
+            "input[id*='profile-name']",
+            "input[class*='profile-name']",
+            "input[placeholder*='Name']",
+        ]
+
+        name_input = None
+        for selector in name_selectors:
+            el = page.locator(selector).first
+            if await el.count() > 0:
+                name_input = el
+                logger.info(f"[{index}] Found name input: {selector}")
+                break
+
+        if name_input is None:
+            edit_btn_selectors = [
+                "button:has-text('Edit')",
+                "a:has-text('Edit')",
+                "[data-uia*='edit']",
+            ]
+            for selector in edit_btn_selectors:
+                el = page.locator(selector).first
+                if await el.count() > 0:
+                    await el.click(force=True)
+                    logger.info(f"[{index}] Clicked edit button: {selector}")
+                    await page.wait_for_timeout(1500)
+                    break
+
+            for selector in name_selectors:
+                el = page.locator(selector).first
+                if await el.count() > 0:
+                    name_input = el
+                    logger.info(f"[{index}] Found name input after edit click: {selector}")
+                    break
+
+        if name_input is None:
+            for inp in all_inputs:
+                inp_type = await inp.get_attribute("type") or "text"
+                inp_name = await inp.get_attribute("name") or ""
+                inp_id = await inp.get_attribute("id") or ""
+                if inp_type in ["text", ""] and "search" not in inp_name.lower():
+                    name_input = inp
+                    logger.info(f"[{index}] Fallback: using text input name={inp_name} id={inp_id}")
+                    break
+
+        if name_input is None:
+            logger.error(f"[{index}] Name input not found. URL: {page.url}")
+            return {"index": index, "success": False, "error": f"Name input not found on {page.url}"}
+
+        await name_input.click()
+        await name_input.press("Control+a")
+        await name_input.fill("")
+        await page.wait_for_timeout(100)
+        await name_input.type(new_name, delay=20)
+        await page.wait_for_timeout(300)
+
+        save_selectors = [
+            "button[data-uia='profile-save-button']",
+            "button:has-text('Save')",
+            "button:has-text('Done')",
+            "button[type='submit']",
+        ]
+
+        save_clicked = False
+        for selector in save_selectors:
+            el = page.locator(selector).first
+            if await el.count() > 0:
+                await el.click(force=True)
+                save_clicked = True
+                logger.info(f"[{index}] Clicked save: {selector}")
+                break
+
+        if not save_clicked:
+            await page.keyboard.press("Enter")
+            logger.info(f"[{index}] Pressed Enter to save")
+
+        await page.wait_for_timeout(2000)
+        logger.info(f"[{index}] Profile update completed: {new_name}")
+        return {"index": index, "success": True, "new_name": new_name}
+
+    async def _update_single_profile(self, guid: str, new_name: str, index: int) -> dict:
+        p = None
+        browser = None
+        try:
+            p, browser, context = await self._launch_browser()
+            page = await context.new_page()
+            result = await self._update_profile_on_page(page, guid, new_name, index)
+            await self._safe_close(p, browser)
+            return result
         except Exception as e:
+            await self._safe_close(p, browser)
             return {"index": index, "success": False, "error": str(e)}
 
     async def update_all_profiles_parallel(self, profiles: List[dict], new_names: List[str]) -> List[dict]:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                viewport={"width": 1280, "height": 900}
-            )
-            await context.add_cookies(self.cookies)
+        p = None
+        browser = None
+        try:
+            p, browser, context = await self._launch_browser()
 
             pages = []
             for _ in profiles:
@@ -311,84 +504,170 @@ class NetflixBrowser:
                 if guid:
                     tasks.append(self._update_profile_on_page(page, guid, new_name, i))
 
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            if not tasks:
+                await self._safe_close(p, browser)
+                return []
 
-            for page in pages:
-                await page.close()
-            await browser.close()
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=120.0
+                )
+            except asyncio.TimeoutError:
+                logger.error("Overall parallel update timed out after 120s")
+                await self._safe_close(p, browser)
+                return [{"index": i, "success": False, "error": "Overall timeout"} for i in range(len(profiles))]
 
-        return results
+            processed = []
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    processed.append({"index": i, "success": False, "error": str(r)})
+                elif isinstance(r, dict):
+                    processed.append(r)
+                else:
+                    processed.append({"index": i, "success": False, "error": f"Unexpected result: {r}"})
 
-    async def _set_pin_on_page(self, page, guid: str, pin: str, password: str, index: int) -> dict:
+            await self._safe_close(p, browser)
+            return processed
+
+        except Exception as e:
+            logger.error(f"Parallel update error: {e}")
+            await self._safe_close(p, browser)
+            return [{"index": i, "success": False, "error": str(e)} for i in range(len(profiles))]
+
+    async def _set_pin_on_page(self, page: Page, guid: str, pin: str, password: str, index: int) -> dict:
         try:
-            await page.goto(f"https://www.netflix.com/settings/lock/{guid}")
-            await page.wait_for_load_state("domcontentloaded")
-            await page.wait_for_timeout(1500)
+            return await asyncio.wait_for(
+                self._do_set_pin(page, guid, pin, password, index),
+                timeout=45.0
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[{index}] PIN set timed out for {guid}")
+            return {"index": index, "success": False, "error": "Timed out after 45s"}
+        except Exception as e:
+            logger.error(f"[{index}] Set PIN error: {e}")
+            return {"index": index, "success": False, "error": str(e)}
+
+    async def _do_set_pin(self, page: Page, guid: str, pin: str, password: str, index: int) -> dict:
+        try:
+            logger.info(f"[{index}] Setting PIN for profile: {guid}")
+
+            await page.goto(f"https://www.netflix.com/settings/lock/{guid}", wait_until="domcontentloaded", timeout=15000)
+            await page.wait_for_timeout(2000)
 
             if "login" in page.url.lower():
                 return {"index": index, "success": False, "error": "Session expired"}
 
-            edit_btn = page.locator("button:has-text('Edit PIN')").first
-            create_btn = page.locator("button:has-text('Create a Profile Lock')").first
+            pin_btn_selectors = [
+                "button:has-text('Edit PIN')",
+                "button:has-text('Create a Profile Lock')",
+                "button:has-text('Create Profile Lock')",
+                "button:has-text('Change')",
+                "a:has-text('Edit PIN')",
+                "a:has-text('Create a Profile Lock')",
+            ]
 
-            if await edit_btn.count() > 0:
-                await edit_btn.click(force=True)
-            elif await create_btn.count() > 0:
-                await create_btn.click(force=True)
-            else:
-                return {"index": index, "success": False, "error": "PIN button not found"}
+            btn_clicked = False
+            for selector in pin_btn_selectors:
+                el = page.locator(selector).first
+                if await el.count() > 0:
+                    await el.click(force=True)
+                    btn_clicked = True
+                    logger.info(f"[{index}] Clicked PIN button: {selector}")
+                    break
+
+            if not btn_clicked:
+                logger.warning(f"[{index}] No PIN button found, trying direct PIN input")
 
             await page.wait_for_timeout(1500)
 
-            confirm_btn = page.locator("button:has-text('Confirm password')").first
-            if await confirm_btn.count() > 0:
-                await confirm_btn.click(force=True)
-                try:
-                    await page.locator("input[type='password']").wait_for(timeout=5000, state="visible")
-                except:
-                    return {"index": index, "success": False, "error": "Password input timeout"}
+            pwd_selectors = [
+                "input[type='password']:visible",
+                "input[data-uia='field-password']:visible",
+                "input[name='password']:visible",
+            ]
 
-            pwd_input = page.locator("input[type='password']:visible").first
-            if await pwd_input.count() > 0:
-                await pwd_input.fill(password)
-                await page.wait_for_timeout(200)
-                await page.keyboard.press("Enter")
-                await page.wait_for_timeout(2000)
+            for selector in pwd_selectors:
+                pwd_input = page.locator(selector).first
+                if await pwd_input.count() > 0:
+                    await pwd_input.fill(password)
+                    await page.wait_for_timeout(300)
 
-                if await page.locator("text=Incorrect password").count() > 0:
-                    return {"index": index, "success": False, "error": "Incorrect password"}
+                    submit_selectors = [
+                        "button:has-text('Continue')",
+                        "button:has-text('Submit')",
+                        "button:has-text('Confirm')",
+                        "button[type='submit']",
+                    ]
+                    submitted = False
+                    for sub_sel in submit_selectors:
+                        sub_btn = page.locator(sub_sel).first
+                        if await sub_btn.count() > 0:
+                            await sub_btn.click(force=True)
+                            submitted = True
+                            break
+                    if not submitted:
+                        await page.keyboard.press("Enter")
 
-            for _ in range(3):
-                pin_input = page.locator("input[inputmode='numeric']:visible, input[maxlength='4']:visible").first
-                if await pin_input.count() > 0:
+                    await page.wait_for_timeout(2000)
+
+                    if await page.locator("text=Incorrect password").count() > 0 or \
+                       await page.locator("text=Wrong password").count() > 0:
+                        return {"index": index, "success": False, "error": "Incorrect password"}
+                    break
+
+            pin_selectors = [
+                "input[inputmode='numeric']:visible",
+                "input[maxlength='4']:visible",
+                "input[data-uia*='pin']:visible",
+                "input[name*='pin']:visible",
+                "input[type='tel']:visible",
+            ]
+
+            pin_input = None
+            for _ in range(5):
+                for selector in pin_selectors:
+                    el = page.locator(selector).first
+                    if await el.count() > 0:
+                        pin_input = el
+                        logger.info(f"[{index}] Found PIN input: {selector}")
+                        break
+                if pin_input:
                     break
                 await page.wait_for_timeout(500)
 
-            if await pin_input.count() > 0:
+            if pin_input and await pin_input.count() > 0:
+                await pin_input.click()
                 await pin_input.fill(pin)
-                await page.wait_for_timeout(200)
+                await page.wait_for_timeout(300)
 
-                save_btn = page.locator("button:has-text('Save'):visible").last
-                if await save_btn.count() > 0:
-                    await save_btn.click(force=True)
-                    await page.wait_for_timeout(1000)
+                save_selectors = [
+                    "button:has-text('Save'):visible",
+                    "button:has-text('Done'):visible",
+                    "button[type='submit']:visible",
+                ]
+                for selector in save_selectors:
+                    el = page.locator(selector).last
+                    if await el.count() > 0:
+                        await el.click(force=True)
+                        logger.info(f"[{index}] Clicked save: {selector}")
+                        break
 
+                await page.wait_for_timeout(1500)
+                logger.info(f"[{index}] PIN set successfully: {pin}")
                 return {"index": index, "success": True, "pin": pin}
             else:
                 return {"index": index, "success": False, "error": "PIN input not found"}
 
         except Exception as e:
+            logger.error(f"[{index}] Set PIN error: {e}")
             return {"index": index, "success": False, "error": str(e)}
 
-    async def set_all_pins_fast(self, profiles: List[dict], pins: List[str], password: str) -> List[dict]:
-        results = []
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 900}
-            )
-            await context.add_cookies(self.cookies)
+    async def set_all_pins_parallel(self, profiles: List[dict], pins: List[str], password: str) -> List[dict]:
+        p = None
+        browser = None
+        try:
+            p, browser, context = await self._launch_browser()
 
             pages = []
             for _ in profiles:
@@ -400,80 +679,69 @@ class NetflixBrowser:
                 if guid:
                     tasks.append(self._set_pin_on_page(page, guid, pin, password, i))
 
+            if not tasks:
+                await self._safe_close(p, browser)
+                return []
+
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            for page in pages:
-                await page.close()
-            await browser.close()
+            processed = []
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    processed.append({"index": i, "success": False, "error": str(r)})
+                elif isinstance(r, dict):
+                    processed.append(r)
+                else:
+                    processed.append({"index": i, "success": False, "error": f"Unexpected result: {r}"})
 
-        return results
+            await self._safe_close(p, browser)
+            return processed
 
-    async def _set_single_pin(self, guid: str, pin: str, password: str, index: int) -> dict:
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    viewport={"width": 1280, "height": 900}
-                )
-                await context.add_cookies(self.cookies)
-                page = await context.new_page()
-                result = await self._set_pin_on_page(page, guid, pin, password, index)
-                await browser.close()
-                return result
         except Exception as e:
-            return {"index": index, "success": False, "error": str(e)}
+            logger.error(f"Parallel PIN error: {e}")
+            await self._safe_close(p, browser)
+            return [{"index": i, "success": False, "error": str(e)} for i in range(len(profiles))]
 
     async def _delete_profile_lock(self, guid: str, password: str, index: int) -> dict:
+        p = None
+        browser = None
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    viewport={"width": 1280, "height": 900}
-                )
-                await context.add_cookies(self.cookies)
-                page = await context.new_page()
+            p, browser, context = await self._launch_browser()
+            page = await context.new_page()
 
-                await page.goto(f"https://www.netflix.com/settings/lock/{guid}")
-                await page.wait_for_timeout(2000)
+            await page.goto(f"https://www.netflix.com/settings/lock/{guid}", wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
 
-                if "login" in page.url.lower():
-                    await browser.close()
-                    return {"index": index, "success": False, "error": "Session expired"}
+            if "login" in page.url.lower():
+                await self._safe_close(p, browser)
+                return {"index": index, "success": False, "error": "Session expired"}
 
-                delete_lock_btn = page.locator("button:has-text('Delete Profile Lock')").first
-                if await delete_lock_btn.count() == 0:
-                    await browser.close()
-                    return {"index": index, "success": True, "message": "No lock to delete"}
+            delete_btn = page.locator("button:has-text('Delete Profile Lock')").first
+            if await delete_btn.count() == 0:
+                delete_btn = page.locator("button:has-text('Remove Lock')").first
+            if await delete_btn.count() == 0:
+                await self._safe_close(p, browser)
+                return {"index": index, "success": True, "message": "No lock to delete"}
 
-                await delete_lock_btn.click(force=True)
-                await page.wait_for_timeout(2000)
+            await delete_btn.click(force=True)
+            await page.wait_for_timeout(2000)
 
-                confirm_btn = page.locator("button:has-text('Confirm password')").first
-                if await confirm_btn.count() > 0:
-                    await confirm_btn.click(force=True)
-                    try:
-                        await page.locator("input[type='password']").wait_for(timeout=5000, state="visible")
-                    except:
-                        await browser.close()
-                        return {"index": index, "success": False, "error": "Password input timeout"}
+            pwd_input = page.locator("input[type='password']:visible").first
+            if await pwd_input.count() > 0:
+                await pwd_input.fill(password)
+                await page.wait_for_timeout(300)
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(2500)
 
-                pwd_input = page.locator("input[type='password']:visible").first
-                if await pwd_input.count() > 0:
-                    await pwd_input.fill(password)
-                    await page.wait_for_timeout(300)
-                    await page.keyboard.press("Enter")
-                    await page.wait_for_timeout(2500)
+                if await page.locator("text=Incorrect password").count() > 0:
+                    await self._safe_close(p, browser)
+                    return {"index": index, "success": False, "error": "Incorrect password"}
 
-                    if await page.locator("text=Incorrect password").count() > 0:
-                        await browser.close()
-                        return {"index": index, "success": False, "error": "Incorrect password"}
-
-                await browser.close()
-                return {"index": index, "success": True, "message": "Lock deleted"}
+            await self._safe_close(p, browser)
+            return {"index": index, "success": True, "message": "Lock deleted"}
 
         except Exception as e:
+            await self._safe_close(p, browser)
             return {"index": index, "success": False, "error": str(e)}
 
     async def delete_all_profile_locks(self, profiles: List[dict], password: str) -> List[dict]:
@@ -482,67 +750,104 @@ class NetflixBrowser:
             guid = profile.get("guid", "")
             if guid:
                 tasks.append(self._delete_profile_lock(guid, password, i))
+        if not tasks:
+            return []
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        return results
-
-    async def set_all_pins_parallel(self, profiles: List[dict], pins: List[str], password: str) -> List[dict]:
-        return await self.set_all_pins_fast(profiles, pins, password)
+        processed = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                processed.append({"index": i, "success": False, "error": str(r)})
+            elif isinstance(r, dict):
+                processed.append(r)
+            else:
+                processed.append({"index": i, "success": False, "error": str(r)})
+        return processed
 
     async def _add_single_profile(self, name: str, index: int) -> dict:
+        p = None
+        browser = None
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    viewport={"width": 1280, "height": 900}
-                )
-                await context.add_cookies(self.cookies)
-                page = await context.new_page()
+            p, browser, context = await self._launch_browser()
+            page = await context.new_page()
 
-                await page.goto("https://www.netflix.com/ManageProfiles")
-                await page.wait_for_timeout(1500)
+            await page.goto("https://www.netflix.com/ManageProfiles", wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
 
-                if "login" in page.url.lower():
-                    await browser.close()
-                    return {"index": index, "success": False, "error": "Session expired"}
+            if "login" in page.url.lower():
+                await self._safe_close(p, browser)
+                return {"index": index, "success": False, "error": "Session expired"}
 
-                add_btn = page.locator("text=Add Profile").first
-                if await add_btn.count() == 0:
-                    await browser.close()
-                    return {"index": index, "success": False, "error": "Add Profile button not found"}
+            add_selectors = [
+                "a:has-text('Add Profile')",
+                "button:has-text('Add Profile')",
+                "[data-uia='add-profile-button']",
+                "text=Add Profile",
+            ]
 
-                await add_btn.click(force=True)
-                await page.wait_for_timeout(2000)
+            add_clicked = False
+            for selector in add_selectors:
+                el = page.locator(selector).first
+                if await el.count() > 0:
+                    await el.click(force=True)
+                    add_clicked = True
+                    break
 
-                name_input = page.locator("input[name='name']").first
-                if await name_input.count() == 0:
-                    name_input = page.locator("[data-uia='profile-gate-add-profile-modal+name-input']").first
-                if await name_input.count() == 0:
-                    all_inputs = await page.locator("input:visible").all()
-                    for inp in all_inputs:
-                        inp_type = await inp.get_attribute("type") or "text"
-                        placeholder = await inp.get_attribute("placeholder") or ""
-                        if inp_type in ["text", ""] and "search" not in placeholder.lower():
-                            name_input = inp
-                            break
+            if not add_clicked:
+                await self._safe_close(p, browser)
+                return {"index": index, "success": False, "error": "Add Profile button not found"}
 
-                if not name_input or await name_input.count() == 0:
-                    await browser.close()
-                    return {"index": index, "success": False, "error": "Name input not found"}
+            await page.wait_for_timeout(2000)
 
-                await name_input.fill(name)
-                await page.wait_for_timeout(300)
+            name_selectors = [
+                "input[data-uia='profile-name-entry']",
+                "input[name='name']",
+                "input[name='profileName']",
+                "input[data-uia='profile-gate-add-profile-modal+name-input']",
+                "input[type='text']:visible",
+            ]
 
-                save_btn = page.locator("button:has-text('Save'):visible").last
-                if await save_btn.count() > 0:
-                    await save_btn.click(force=True)
-                    await page.wait_for_timeout(1500)
+            name_input = None
+            for selector in name_selectors:
+                el = page.locator(selector).first
+                if await el.count() > 0:
+                    name_input = el
+                    break
 
-                await browser.close()
-                return {"index": index, "success": True, "name": name}
+            if name_input is None or await name_input.count() == 0:
+                all_inputs = await page.locator("input:visible").all()
+                for inp in all_inputs:
+                    inp_type = await inp.get_attribute("type") or "text"
+                    if inp_type in ["text", ""]:
+                        name_input = inp
+                        break
+
+            if name_input is None or await name_input.count() == 0:
+                await self._safe_close(p, browser)
+                return {"index": index, "success": False, "error": "Name input not found"}
+
+            await name_input.fill(name)
+            await page.wait_for_timeout(300)
+
+            save_selectors = [
+                "button:has-text('Save'):visible",
+                "button:has-text('Continue'):visible",
+                "button[data-uia='profile-save-button']",
+                "button[type='submit']:visible",
+            ]
+
+            for selector in save_selectors:
+                el = page.locator(selector).last
+                if await el.count() > 0:
+                    await el.click(force=True)
+                    break
+
+            await page.wait_for_timeout(2000)
+            await self._safe_close(p, browser)
+            return {"index": index, "success": True, "name": name}
 
         except Exception as e:
             logger.error(f"Add profile error: {e}")
+            await self._safe_close(p, browser)
             return {"index": index, "success": False, "error": str(e)}
 
     async def add_profiles_parallel(self, names: List[str]) -> List[dict]:
@@ -550,26 +855,23 @@ class NetflixBrowser:
         for i, name in enumerate(names):
             result = await self._add_single_profile(name, i)
             results.append(result)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
         return results
 
-    async def take_profiles_screenshot(self) -> bytes:
+    async def take_profiles_screenshot(self) -> Optional[bytes]:
+        p = None
+        browser = None
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    viewport={"width": 1280, "height": 800}
-                )
-                await context.add_cookies(self.cookies)
-                page = await context.new_page()
-                await page.goto("https://www.netflix.com/ManageProfiles", wait_until="domcontentloaded")
-                await page.wait_for_timeout(1500)
-                screenshot = await page.screenshot(type='png')
-                await browser.close()
-                return screenshot
+            p, browser, context = await self._launch_browser()
+            page = await context.new_page()
+            await page.goto("https://www.netflix.com/ManageProfiles", wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
+            screenshot = await page.screenshot(type='png')
+            await self._safe_close(p, browser)
+            return screenshot
         except Exception as e:
             logger.error(f"Screenshot error: {e}")
+            await self._safe_close(p, browser)
             return None
 
     async def update_profile(self, guid: str, new_name: str) -> tuple:
@@ -585,59 +887,71 @@ class NetflixBrowser:
         return False, result.get("error", "Failed")
 
     async def delete_profile(self, guid: str) -> tuple:
+        p = None
+        browser = None
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    viewport={"width": 1280, "height": 900}
-                )
-                await context.add_cookies(self.cookies)
-                page = await context.new_page()
+            p, browser, context = await self._launch_browser()
+            page = await context.new_page()
 
-                await page.goto(f"https://www.netflix.com/settings/{guid}")
+            await page.goto(f"https://www.netflix.com/settings/{guid}", wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
+
+            if "login" in page.url.lower():
+                await self._safe_close(p, browser)
+                return False, "Session expired"
+
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1000)
+
+            delete_btn = page.locator("button:has-text('Delete Profile')").first
+            if await delete_btn.count() == 0:
+                delete_btn = page.locator("a:has-text('Delete Profile')").first
+            if await delete_btn.count() == 0:
+                delete_btn = page.locator("text=Delete Profile").first
+
+            if await delete_btn.count() > 0:
+                await delete_btn.click(force=True)
                 await page.wait_for_timeout(2000)
 
-                if "login" in page.url.lower():
-                    await browser.close()
-                    return False, "Session expired"
+                confirm_selectors = [
+                    "[data-uia='profile-settings-page+delete-profile+destructive-button']",
+                    "button:has-text('Delete Profile')",
+                    "button:has-text('Confirm')",
+                    "button:has-text('Yes')",
+                ]
 
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1000)
-
-                delete_btn = page.locator("text=Delete Profile").first
-                if await delete_btn.count() > 0:
-                    await delete_btn.click(force=True)
-                    await page.wait_for_timeout(2000)
-
-                    confirm_btn = page.locator("[data-uia='profile-settings-page+delete-profile+destructive-button']")
-                    if await confirm_btn.count() > 0:
-                        await confirm_btn.click(force=True)
+                for selector in confirm_selectors:
+                    el = page.locator(selector).last
+                    if await el.count() > 0:
+                        await el.click(force=True)
                         await page.wait_for_timeout(2000)
-                        await browser.close()
+                        await self._safe_close(p, browser)
                         return True, "Profile deleted!"
 
-                    all_delete_btns = await page.locator("button:has-text('Delete Profile')").all()
-                    if len(all_delete_btns) > 1:
-                        await all_delete_btns[1].click(force=True)
-                        await page.wait_for_timeout(2000)
-                        await browser.close()
-                        return True, "Profile deleted!"
-
-                    await browser.close()
-                    return False, "Confirmation button not found"
-                else:
-                    await browser.close()
-                    return False, "Delete Profile button not found"
+                await self._safe_close(p, browser)
+                return False, "Confirmation button not found"
+            else:
+                await self._safe_close(p, browser)
+                return False, "Delete Profile button not found"
 
         except Exception as e:
+            await self._safe_close(p, browser)
             return False, f"Error: {str(e)}"
 
     async def set_profile_pin(self, guid: str, pin: str, password: str = "") -> tuple:
-        result = await self._set_single_pin(guid, pin, password, 0)
-        if result.get("success"):
-            return True, "Profile PIN set!"
-        return False, result.get("error", "Unknown error")
+        p = None
+        browser = None
+        try:
+            p, browser, context = await self._launch_browser()
+            page = await context.new_page()
+            result = await self._set_pin_on_page(page, guid, pin, password, 0)
+            await self._safe_close(p, browser)
+            if result.get("success"):
+                return True, "Profile PIN set!"
+            return False, result.get("error", "Unknown error")
+        except Exception as e:
+            await self._safe_close(p, browser)
+            return False, f"Error: {str(e)}"
 
 
 async def is_authorized(user_id: int) -> bool:
@@ -663,18 +977,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         "*Netflix Profile Manager Bot*\n\n"
-        "*Commands:*\n"
+        "*Session Commands:*\n"
         "`/login <cookie>` - Login with Netflix cookie\n"
         "`/loginemail <email> <password>` - Login with email/password\n"
         "`/profiles` - List all profiles\n"
-        "`/updateallprofiles <n1> <n2> ... <password>` - Update ALL names (parallel)\n"
-        "`/updateallpins <p1> <p2> ... <password>` - Set ALL PINs (parallel)\n"
+        "`/logout` - Clear session\n\n"
+        "*Profile Management:*\n"
+        "`/updateallprofiles <n1> <n2> ... <password>` - Update ALL names\n"
+        "`/updateallpins <p1> <p2> ... <password>` - Set ALL PINs\n"
         "`/addprofile <name>` - Add new profile\n"
         "`/deleteprofile <guid>` - Delete profile\n"
-        "`/logout` - Clear session\n\n"
+        "`/updateprofile <guid> <name>` - Update single profile\n"
+        "`/setpin <guid> <pin> <password>` - Set single PIN\n\n"
         "*Admin:*\n"
         "`/adduser <id>` | `/removeuser <id>` | `/listusers`\n\n"
-        "Use `/help` for details."
+        "Use `/help` for examples."
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -686,15 +1003,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = (
-        "*Help*\n\n"
+        "*Help & Examples*\n\n"
         "*Bulk Update Examples:*\n"
-        "`/updateallprofiles mar jin kon dam reen MyPassword`\n"
+        "`/updateallprofiles MOON SUN LIGHT DARK FUSION MyPassword`\n"
         "`/updateallpins 1111 2222 3333 4444 5555 MyPassword`\n\n"
-        "Both commands run in PARALLEL (multiple browsers simultaneously)!\n\n"
+        "Both commands run in PARALLEL (multiple browser tabs)!\n"
+        "The LAST argument is always your Netflix account password.\n\n"
         "*Single Profile:*\n"
         "`/updateprofile <guid> NewName`\n"
         "`/setpin <guid> 1234 MyPassword`\n\n"
-        "*Cookie:* Get from browser DevTools > Application > Cookies"
+        "*Login:*\n"
+        "Get cookie from browser DevTools > Application > Cookies\n"
+        "Copy NetflixId and SecureNetflixId values\n\n"
+        "*Note:* Profile updates use browser automation and may take 10-30 seconds."
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -710,7 +1031,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cookie = ' '.join(context.args)
-    msg = await update.message.reply_text("Validating...")
+    msg = await update.message.reply_text("Validating session...")
 
     try:
         netflix = NetflixBrowser(cookie)
@@ -718,10 +1039,11 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if valid:
             netflix_sessions[user_id] = {"browser": netflix, "cookie": cookie}
-            await msg.edit_text("*Login Successful!*\nUse `/profiles` to see profiles.", parse_mode='Markdown')
+            await msg.edit_text("Login Successful!\nUse /profiles to see profiles.")
         else:
             await msg.edit_text(f"Failed: {result}")
     except Exception as e:
+        logger.error(f"Login error: {e}")
         await msg.edit_text(f"Error: {str(e)}")
 
 
@@ -754,6 +1076,7 @@ async def loginemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             await msg.edit_text(f"Failed: {result}")
     except Exception as e:
+        logger.error(f"Login email error: {e}")
         await msg.edit_text(f"Error: {str(e)}")
 
 
@@ -788,13 +1111,15 @@ async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = "Netflix Profiles:\n\n"
                 for i, p in enumerate(profiles, 1):
                     kids_tag = " [Kids]" if p.get("isKids", False) else ""
-                    text += f"{i}. {p['profileName']}{kids_tag}\n   {p['guid']}\n\n"
+                    text += f"{i}. {p['profileName']}{kids_tag}\n   GUID: {p['guid']}\n\n"
+                text += f"Total: {len(profiles)} profiles"
                 await msg.edit_text(text)
             else:
                 await msg.edit_text("No profiles found.")
         else:
             await msg.edit_text(f"Failed: {data}")
     except Exception as e:
+        logger.error(f"Profiles error: {e}")
         await msg.edit_text(f"Error: {str(e)}")
 
 
@@ -809,7 +1134,10 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
         return
 
     if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Usage: /updateallprofiles name1 name2 ... password\n(Password is your Netflix account password)")
+        await update.message.reply_text(
+            "Usage: /updateallprofiles name1 name2 ... password\n"
+            "(Last argument is your Netflix account password)"
+        )
         return
 
     args = list(context.args)
@@ -827,7 +1155,7 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
         success, data = await netflix.get_profiles()
 
         if not success:
-            await msg.edit_text(f"Failed: {data}")
+            await msg.edit_text(f"Failed to fetch profiles: {data}")
             return
 
         profiles = data.get("profiles", [])
@@ -841,25 +1169,24 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
         need_to_add = names_count > existing_count
 
         if need_to_add and profiles:
-            await msg.edit_text("Removing profile locks...")
+            await msg.edit_text("Removing profile locks first...")
             lock_results = await netflix.delete_all_profile_locks(profiles, password)
             deleted_locks = sum(1 for r in lock_results if isinstance(r, dict) and r.get("success"))
             logger.info(f"Deleted {deleted_locks}/{len(profiles)} profile locks")
 
+        info_text = f"Found {existing_count} profiles"
         if kids_count > 0:
-            await msg.edit_text(
-                f"Found {existing_count} profiles ({kids_count} Kids)\n"
-                f"Kids profiles will be replaced with new regular profiles"
-            )
-        else:
-            await msg.edit_text(f"Found {existing_count} profiles, need {names_count} names")
+            info_text += f" ({kids_count} Kids)"
+        info_text += f"\nNames to set: {names_count}"
+        await msg.edit_text(info_text)
+        await asyncio.sleep(1)
 
         results = []
         name_idx = 0
 
         regular_to_update = min(len(regular_profiles), names_count)
         if regular_to_update > 0:
-            await msg.edit_text(f"Updating {regular_to_update} regular profiles...")
+            await msg.edit_text(f"Updating {regular_to_update} regular profiles in parallel...")
 
             update_profiles = regular_profiles[:regular_to_update]
             update_names = new_names[:regular_to_update]
@@ -925,18 +1252,24 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
         text += "\n".join(results)
         text += f"\n\n{success_count}/{names_count} completed!"
 
-        screenshot_task = asyncio.create_task(netflix.take_profiles_screenshot())
         await msg.edit_text(text)
 
-        screenshot = await screenshot_task
-        if screenshot:
-            await update.message.reply_photo(
-                photo=InputFile(io.BytesIO(screenshot), filename="profiles.png"),
-                caption="Profiles updated!"
-            )
+        try:
+            screenshot = await netflix.take_profiles_screenshot()
+            if screenshot:
+                await update.message.reply_photo(
+                    photo=InputFile(io.BytesIO(screenshot), filename="profiles.png"),
+                    caption="Updated profiles"
+                )
+        except Exception as ss_err:
+            logger.error(f"Screenshot error: {ss_err}")
 
     except Exception as e:
-        await msg.edit_text(f"Error: {str(e)}")
+        logger.error(f"Update all profiles error: {e}")
+        try:
+            await msg.edit_text(f"Error: {str(e)}")
+        except:
+            pass
 
 
 async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -957,7 +1290,7 @@ async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     password = context.args[-1]
-    pins = context.args[:-1]
+    pins = list(context.args[:-1])
 
     for i, pin in enumerate(pins):
         if len(pin) != 4 or not pin.isdigit():
@@ -1006,7 +1339,7 @@ async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TY
                 lines.append(f"FAIL {i+1}. {name} ({error})")
 
         for kids_profile in kids_profiles:
-            lines.append(f"SKIP {kids_profile.get('profileName', 'Kids')} (Kids profile - skipped)")
+            lines.append(f"SKIP {kids_profile.get('profileName', 'Kids')} (Kids profile)")
 
         success_count = sum(1 for r in results if isinstance(r, dict) and r.get("success"))
 
@@ -1014,32 +1347,42 @@ async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TY
         text += "\n".join(lines)
         text += f"\n\n{success_count}/{len(regular_profiles)} PINs set!"
 
-        screenshot_task = asyncio.create_task(netflix.take_profiles_screenshot())
         await msg.edit_text(text)
 
-        screenshot = await screenshot_task
-        if screenshot:
-            await update.message.reply_photo(
-                photo=InputFile(io.BytesIO(screenshot), filename="pins.png"),
-                caption="PINs updated!"
-            )
+        try:
+            screenshot = await netflix.take_profiles_screenshot()
+            if screenshot:
+                await update.message.reply_photo(
+                    photo=InputFile(io.BytesIO(screenshot), filename="pins.png"),
+                    caption="PINs updated"
+                )
+        except Exception as ss_err:
+            logger.error(f"Screenshot error: {ss_err}")
 
     except Exception as e:
-        await msg.edit_text(f"Error: {str(e)}")
+        logger.error(f"Update all pins error: {e}")
+        try:
+            await msg.edit_text(f"Error: {str(e)}")
+        except:
+            pass
 
 
 async def addprofile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not await is_authorized(user_id) or user_id not in netflix_sessions:
-        await update.message.reply_text("Login first.")
+    if not await is_authorized(user_id):
+        await update.message.reply_text("Not authorized.")
+        return
+
+    if user_id not in netflix_sessions:
+        await update.message.reply_text("Login first: /login <cookie>")
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: `/addprofile <name>`", parse_mode='Markdown')
+        await update.message.reply_text("Usage: /addprofile <name>")
         return
 
     name = ' '.join(context.args)
-    msg = await update.message.reply_text(f"Creating '{name}'...")
+    msg = await update.message.reply_text(f"Creating profile '{name}'...")
 
     netflix = netflix_sessions[user_id]["browser"]
     success, result = await netflix.add_profile(name)
@@ -1048,17 +1391,21 @@ async def addprofile_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def updateprofile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not await is_authorized(user_id) or user_id not in netflix_sessions:
-        await update.message.reply_text("Login first.")
+    if not await is_authorized(user_id):
+        await update.message.reply_text("Not authorized.")
+        return
+
+    if user_id not in netflix_sessions:
+        await update.message.reply_text("Login first: /login <cookie>")
         return
 
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: `/updateprofile <guid> <name>`", parse_mode='Markdown')
+        await update.message.reply_text("Usage: /updateprofile <guid> <name>")
         return
 
     guid = context.args[0]
     name = ' '.join(context.args[1:])
-    msg = await update.message.reply_text(f"Updating to '{name}'...")
+    msg = await update.message.reply_text(f"Updating profile to '{name}'...")
 
     netflix = netflix_sessions[user_id]["browser"]
     success, result = await netflix.update_profile(guid, name)
@@ -1067,16 +1414,20 @@ async def updateprofile_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def deleteprofile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not await is_authorized(user_id) or user_id not in netflix_sessions:
-        await update.message.reply_text("Login first.")
+    if not await is_authorized(user_id):
+        await update.message.reply_text("Not authorized.")
+        return
+
+    if user_id not in netflix_sessions:
+        await update.message.reply_text("Login first: /login <cookie>")
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: `/deleteprofile <guid>`", parse_mode='Markdown')
+        await update.message.reply_text("Usage: /deleteprofile <guid>")
         return
 
     guid = context.args[0]
-    msg = await update.message.reply_text("Deleting...")
+    msg = await update.message.reply_text("Deleting profile...")
 
     netflix = netflix_sessions[user_id]["browser"]
     success, result = await netflix.delete_profile(guid)
@@ -1085,15 +1436,24 @@ async def deleteprofile_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def setpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not await is_authorized(user_id) or user_id not in netflix_sessions:
-        await update.message.reply_text("Login first.")
+    if not await is_authorized(user_id):
+        await update.message.reply_text("Not authorized.")
+        return
+
+    if user_id not in netflix_sessions:
+        await update.message.reply_text("Login first: /login <cookie>")
         return
 
     if len(context.args) < 3:
-        await update.message.reply_text("Usage: `/setpin <guid> <pin> <password>`", parse_mode='Markdown')
+        await update.message.reply_text("Usage: /setpin <guid> <pin> <password>")
         return
 
     guid, pin, password = context.args[0], context.args[1], context.args[2]
+
+    if len(pin) != 4 or not pin.isdigit():
+        await update.message.reply_text("PIN must be exactly 4 digits.")
+        return
+
     msg = await update.message.reply_text("Setting PIN...")
 
     netflix = netflix_sessions[user_id]["browser"]
@@ -1108,7 +1468,7 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: `/adduser <id>`", parse_mode='Markdown')
+        await update.message.reply_text("Usage: /adduser <telegram_id>")
         return
 
     try:
@@ -1127,8 +1487,11 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.close()
         conn.close()
         await update.message.reply_text(f"User {new_id} authorized!")
-    except:
-        await update.message.reply_text("Invalid ID.")
+    except ValueError:
+        await update.message.reply_text("Invalid ID. Must be a number.")
+    except Exception as e:
+        logger.error(f"Add user error: {e}")
+        await update.message.reply_text(f"Error: {str(e)}")
 
 
 async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1138,13 +1501,13 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: `/removeuser <id>`", parse_mode='Markdown')
+        await update.message.reply_text("Usage: /removeuser <telegram_id>")
         return
 
     try:
         remove_id = int(context.args[0])
         if remove_id == HOST_USER_ID:
-            await update.message.reply_text("Can't remove host.")
+            await update.message.reply_text("Can't remove the host user.")
             return
 
         conn = get_db()
@@ -1160,8 +1523,11 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text(f"User {remove_id} removed.")
         else:
             await update.message.reply_text(f"User {remove_id} not found.")
-    except:
-        await update.message.reply_text("Invalid ID.")
+    except ValueError:
+        await update.message.reply_text("Invalid ID. Must be a number.")
+    except Exception as e:
+        logger.error(f"Remove user error: {e}")
+        await update.message.reply_text(f"Error: {str(e)}")
 
 
 async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1170,19 +1536,23 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Admin only.")
         return
 
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT user_id FROM authorized_users")
-    users = cur.fetchall()
-    cur.close()
-    conn.close()
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT user_id FROM authorized_users")
+        users = cur.fetchall()
+        cur.close()
+        conn.close()
 
-    msg = f"*Host:* `{HOST_USER_ID}`\n\n"
-    if users:
-        msg += "*Users:*\n" + "\n".join([f"- `{u['user_id']}`" for u in users])
-    else:
-        msg += "No other users."
-    await update.message.reply_text(msg, parse_mode='Markdown')
+        msg = f"*Host:* `{HOST_USER_ID}`\n\n"
+        if users:
+            msg += "*Authorized Users:*\n" + "\n".join([f"- `{u['user_id']}`" for u in users])
+        else:
+            msg += "No other authorized users."
+        await update.message.reply_text(msg, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"List users error: {e}")
+        await update.message.reply_text(f"Error: {str(e)}")
 
 
 async def main():
