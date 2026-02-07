@@ -1,27 +1,17 @@
 import type { Express } from "express";
 import type { Server } from "http";
-import { storage } from "./storage";
-import { api } from "@shared/routes";
-import { setupBot } from "./bot";
+import { setupBot, isBotRunning } from "./bot";
 
 export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
   
-  // API Routes
-  app.get(api.bot.status.path, async (req, res) => {
-    const userCount = await storage.getUserCount();
+  app.get("/api/bot/status", async (req, res) => {
     const uptime = process.uptime();
-    res.json({ online: true, uptime, userCount });
+    res.json({ online: isBotRunning(), uptime });
   });
 
-  app.get(api.bot.logs.path, async (req, res) => {
-    const logs = await storage.getLogs();
-    res.json(logs);
-  });
-
-  // Setup Telegram Bot
   try {
     if (process.env.TELEGRAM_BOT_TOKEN) {
       await setupBot();
