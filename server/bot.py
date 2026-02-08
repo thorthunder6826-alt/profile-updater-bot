@@ -584,7 +584,7 @@ class NetflixBrowser:
             except Exception as nav_err:
                 if attempt < 3:
                     logger.warning(f"[{index}] Nav failed (attempt {attempt+1}), retrying...")
-                    await page.wait_for_timeout(1000)
+                    await page.wait_for_timeout(500)
                     continue
                 return {"index": index, "success": False, "error": f"Navigation failed: {short_error(nav_err)}"}
 
@@ -593,7 +593,7 @@ class NetflixBrowser:
 
             if "/browse" in page.url.lower() or "/profilesgate" in page.url.lower():
                 logger.warning(f"[{index}] Redirected to {page.url} (attempt {attempt+1}), retrying...")
-                await page.wait_for_timeout(1500 * (attempt + 1))
+                await page.wait_for_timeout(500 * (attempt + 1))
                 continue
 
             if "/mfa" in page.url.lower():
@@ -616,9 +616,9 @@ class NetflixBrowser:
             clicked_name = await self._click_name_link(page, old_name, index)
             if clicked_name:
                 break
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(300)
             await page.reload(wait_until="domcontentloaded")
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(500)
 
         if not clicked_name:
             return {"index": index, "success": False, "error": "Edit link not found"}
@@ -635,24 +635,24 @@ class NetflixBrowser:
             logger.warning(f"[{index}] Redirected to browse after clicking name")
             return {"index": index, "success": False, "error": "Redirected away from settings"}
 
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(400)
 
         in_page_mfa = await self._handle_in_page_mfa(page, password, index)
         if in_page_mfa == "failed":
             return {"index": index, "success": False, "error": "MFA password verification failed"}
 
         name_input = None
-        for attempt in range(25):
+        for attempt in range(20):
             name_input = await self._try_find_name_input(page, index)
             if name_input:
                 break
 
             mfa_check = await self._handle_in_page_mfa(page, password, index)
             if mfa_check == "handled":
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(500)
                 continue
 
-            await page.wait_for_timeout(300)
+            await page.wait_for_timeout(250)
 
         if name_input is None:
             logger.warning(f"[{index}] Name input not found on {page.url}")
@@ -751,35 +751,35 @@ class NetflixBrowser:
         if not items:
             return [{"index": i, "success": False, "error": "No GUID"} for i in range(len(profiles))]
 
-        logger.info(f"Renaming {len(items)} profiles sequentially (single browser)")
+        concurrency = min(3, len(items))
+        logger.info(f"Renaming {len(items)} profiles in parallel (concurrency={concurrency}, single browser)")
 
         results = [None] * len(profiles)
+        sem = asyncio.Semaphore(concurrency)
 
         p = None
         browser = None
         context = None
+        browser_lock = asyncio.Lock()
 
         async def ensure_browser():
             nonlocal p, browser, context
-            if browser is None or not browser.is_connected():
-                await self._safe_close(p, browser)
-                p, browser, context = await self._launch_browser()
-                logger.info("Launched new browser for rename batch")
-            return context
+            async with browser_lock:
+                if browser is None or not browser.is_connected():
+                    await self._safe_close(p, browser)
+                    p, browser, context = await self._launch_browser()
+                    logger.info("Launched new browser for rename batch")
+                return context
 
-        try:
-            context = await ensure_browser()
-
-            for j, (idx, guid, new_name) in enumerate(items):
-                if j > 0:
-                    await asyncio.sleep(0.5)
-                old_name = profiles[idx].get("profileName", "Unknown")
-                page = None
-                r = None
+        async def rename_one(idx, guid, new_name):
+            old_name = profiles[idx].get("profileName", "Unknown")
+            r = None
+            async with sem:
                 for attempt in range(3):
+                    page = None
                     try:
-                        context = await ensure_browser()
-                        page = await context.new_page()
+                        ctx = await ensure_browser()
+                        page = await ctx.new_page()
                         r = await self._do_update_profile(page, guid, new_name, password, idx)
                     except Exception as e:
                         logger.error(f"[{idx}] Rename error (attempt {attempt+1}): {e}")
@@ -790,22 +790,25 @@ class NetflixBrowser:
                                 await page.close()
                             except:
                                 pass
-                            page = None
 
                     if isinstance(r, dict) and r.get("success"):
                         break
                     if attempt < 2:
                         logger.info(f"[{idx}] Retrying rename (attempt {attempt+2}/3)...")
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(0.5)
 
-                if r is None:
-                    r = {"index": idx, "success": False, "error": "All attempts failed"}
-                results[idx] = r
-                if progress_callback:
-                    success = isinstance(r, dict) and r.get("success", False)
-                    error = r.get("error") if isinstance(r, dict) and not success else None
-                    await progress_callback(idx, old_name, new_name, success, error)
+            if r is None:
+                r = {"index": idx, "success": False, "error": "All attempts failed"}
+            results[idx] = r
+            if progress_callback:
+                success = isinstance(r, dict) and r.get("success", False)
+                error = r.get("error") if isinstance(r, dict) and not success else None
+                await progress_callback(idx, old_name, new_name, success, error)
 
+        try:
+            await ensure_browser()
+            tasks = [rename_one(idx, guid, new_name) for idx, guid, new_name in items]
+            await asyncio.gather(*tasks)
             await self._safe_close(p, browser)
         except Exception as e:
             logger.error(f"Browser-level error in rename batch: {e}")
