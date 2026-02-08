@@ -164,6 +164,20 @@ class NetflixBrowser:
     async def login_with_credentials(email: str, password: str) -> tuple:
         p = None
         browser = None
+
+        async def cleanup():
+            nonlocal p, browser
+            try:
+                if browser:
+                    await browser.close()
+            except:
+                pass
+            try:
+                if p:
+                    await p.stop()
+            except:
+                pass
+
         try:
             p = await async_playwright().start()
             browser = await p.chromium.launch(headless=True, args=CHROME_ARGS)
@@ -173,103 +187,135 @@ class NetflixBrowser:
             )
             page = await context.new_page()
 
+            logger.info(f"Navigating to Netflix login page...")
             await page.goto("https://www.netflix.com/login", wait_until="domcontentloaded")
-            await page.wait_for_timeout(3000)
+
+            for _ in range(10):
+                if "login" in page.url.lower():
+                    break
+                await page.wait_for_timeout(500)
 
             if "login" not in page.url.lower():
-                await browser.close()
-                await p.stop()
+                await cleanup()
                 return False, "Could not reach login page", ""
 
-            email_input = page.locator("input[name='userLoginId']").first
-            if await email_input.count() == 0:
-                email_input = page.locator("input[type='email']").first
-            if await email_input.count() == 0:
-                await browser.close()
-                await p.stop()
-                return False, "Email input not found", ""
+            logger.info(f"On login page: {page.url}")
 
-            await email_input.click()
-            await page.keyboard.type(email, delay=30)
-            await page.wait_for_timeout(500)
-
-            continue_btn = page.locator("button[type='submit']").first
-            if await continue_btn.count() > 0:
-                await continue_btn.click()
-                await page.wait_for_timeout(3000)
-
-            pwd_input = page.locator("input[name='password'], input[type='password']").first
-            for _ in range(5):
-                if await pwd_input.count() > 0:
+            email_selectors = [
+                "input[name='userLoginId']",
+                "input[type='email']",
+                "input[id='id_userLoginId']",
+                "input[autocomplete='email']",
+            ]
+            email_input = None
+            for _ in range(10):
+                for sel in email_selectors:
+                    el = page.locator(sel).first
+                    if await el.count() > 0 and await el.is_visible():
+                        email_input = el
+                        break
+                if email_input:
                     break
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(300)
 
-            if await pwd_input.count() == 0:
-                await browser.close()
-                await p.stop()
-                return False, "Password input not found", ""
+            if not email_input:
+                await cleanup()
+                return False, "Email input not found on login page", ""
 
+            logger.info("Found email input, typing email...")
+            await email_input.click()
+            await email_input.fill("")
+            await email_input.type(email, delay=20)
+            await page.wait_for_timeout(300)
+
+            submit_btn = page.locator("button[type='submit']").first
+            if await submit_btn.count() > 0:
+                await submit_btn.click()
+                logger.info("Clicked submit/continue button")
+
+            pwd_input = None
+            for _ in range(15):
+                for sel in ["input[name='password']", "input[type='password']", "input[autocomplete='current-password']"]:
+                    el = page.locator(sel).first
+                    if await el.count() > 0 and await el.is_visible():
+                        pwd_input = el
+                        break
+                if pwd_input:
+                    break
+                await page.wait_for_timeout(300)
+
+            if not pwd_input:
+                error_el = page.locator("[data-uia='error-message-container'], .ui-message-contents").first
+                if await error_el.count() > 0:
+                    err_text = (await error_el.text_content() or "").strip()
+                    if err_text:
+                        await cleanup()
+                        return False, f"Login error: {err_text}", ""
+                await cleanup()
+                return False, "Password field not found — email may be invalid", ""
+
+            logger.info("Found password input, typing password...")
             await pwd_input.click()
-            await page.keyboard.type(password, delay=30)
-            await page.wait_for_timeout(500)
+            await pwd_input.fill("")
+            await pwd_input.type(password, delay=20)
+            await page.wait_for_timeout(300)
 
             sign_in_btn = page.locator("button[type='submit']").first
             if await sign_in_btn.count() > 0:
                 await sign_in_btn.click()
+                logger.info("Clicked sign-in button")
             else:
                 await page.keyboard.press("Enter")
+                logger.info("Pressed Enter to submit")
 
-            await page.wait_for_timeout(6000)
+            success_pages = ["browse", "profile", "manageprofile", "YourAccount"]
+            logged_in = False
+            for _ in range(30):
+                await page.wait_for_timeout(300)
+                url = page.url.lower()
 
-            error_msg = page.locator("[data-uia='error-message-container'], .ui-message-contents, [data-uia='text']").first
-            if await error_msg.count() > 0:
-                error_text = await error_msg.text_content()
-                if error_text and any(w in error_text.lower() for w in ["incorrect", "wrong", "invalid"]):
-                    await browser.close()
-                    await p.stop()
-                    return False, f"Login failed: {error_text}", ""
+                if any(sp.lower() in url for sp in success_pages):
+                    logged_in = True
+                    break
 
-            current_url = page.url.lower()
-            if "login" in current_url and "browse" not in current_url and "profile" not in current_url:
-                await page.wait_for_timeout(2000)
-                current_url = page.url.lower()
-                if "login" in current_url:
-                    await browser.close()
-                    await p.stop()
-                    return False, "Login failed - check credentials", ""
+                error_el = page.locator("[data-uia='error-message-container'], .ui-message-contents").first
+                if await error_el.count() > 0:
+                    err_text = (await error_el.text_content() or "").strip()
+                    if err_text and any(w in err_text.lower() for w in ["incorrect", "wrong", "invalid", "try again", "not right"]):
+                        await cleanup()
+                        return False, f"Login failed: {err_text}", ""
 
-            if "browse" in current_url or "profile" in current_url:
-                cookies = await context.cookies()
-                cookie_parts = []
-                for cookie in cookies:
-                    if cookie["name"] in ["NetflixId", "SecureNetflixId"]:
-                        cookie_parts.append(f"{cookie['name']}={cookie['value']}")
-
-                if len(cookie_parts) >= 2:
-                    cookie_string = "; ".join(cookie_parts)
-                    await browser.close()
-                    await p.stop()
-                    return True, "Login successful!", cookie_string
+            if not logged_in:
+                url = page.url.lower()
+                if "login" in url:
+                    await cleanup()
+                    return False, "Login failed — check your email and password", ""
+                elif any(sp.lower() in url for sp in success_pages):
+                    logged_in = True
                 else:
-                    await browser.close()
-                    await p.stop()
-                    return False, "Could not extract session cookies", ""
+                    await cleanup()
+                    return False, f"Login ended on unexpected page: {page.url}", ""
 
-            await browser.close()
-            await p.stop()
-            return False, f"Login failed - unexpected page: {page.url}", ""
+            logger.info(f"Login successful, extracting cookies from: {page.url}")
+            cookies = await context.cookies()
+            cookie_parts = []
+            for cookie in cookies:
+                if cookie["name"] in ["NetflixId", "SecureNetflixId"]:
+                    cookie_parts.append(f"{cookie['name']}={cookie['value']}")
+
+            if len(cookie_parts) >= 2:
+                cookie_string = "; ".join(cookie_parts)
+                await cleanup()
+                return True, "Login successful!", cookie_string
+            else:
+                available = [c["name"] for c in cookies if "netflix" in c["name"].lower()]
+                logger.warning(f"Missing session cookies. Available netflix cookies: {available}")
+                await cleanup()
+                return False, "Login succeeded but session cookies not found", ""
 
         except Exception as e:
-            if browser:
-                try:
-                    await browser.close()
-                except:
-                    pass
-            if p:
-                try:
-                    await p.stop()
-                except:
-                    pass
+            logger.error(f"Login with credentials error: {e}")
+            await cleanup()
             return False, f"Error: {str(e)}", ""
 
     async def validate_session(self) -> tuple:
