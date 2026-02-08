@@ -606,33 +606,40 @@ class NetflixBrowser:
                 break
 
         if not on_settings:
-            logger.warning(f"[{index}] Could not reach settings page, falling back to recreate")
-            return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
+            logger.warning(f"[{index}] Could not reach settings page after retries")
+            return {"index": index, "success": False, "error": "Could not reach settings page"}
 
         logger.info(f"[{index}] On settings page: {page.url}")
 
-        clicked_name = await self._click_name_link(page, old_name, index)
+        clicked_name = False
+        for click_attempt in range(3):
+            clicked_name = await self._click_name_link(page, old_name, index)
+            if clicked_name:
+                break
+            await page.wait_for_timeout(500)
+            await page.reload(wait_until="domcontentloaded")
+            await page.wait_for_timeout(1000)
+
         if not clicked_name:
-            return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
+            return {"index": index, "success": False, "error": "Edit link not found"}
 
         if "/mfa" in page.url.lower():
             mfa_ok = await self._handle_mfa_if_needed(page, password, settings_url, index)
             if not mfa_ok:
-                logger.info(f"[{index}] MFA triggered for profile edit - using delete+recreate fallback")
-                return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
+                return {"index": index, "success": False, "error": "MFA verification failed"}
             clicked_name = await self._click_name_link(page, old_name, index)
             if not clicked_name:
-                return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
+                return {"index": index, "success": False, "error": "Edit link not found after MFA"}
 
         if "/browse" in page.url.lower():
-            logger.warning(f"[{index}] Redirected to browse after clicking name, falling back to recreate")
-            return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
+            logger.warning(f"[{index}] Redirected to browse after clicking name")
+            return {"index": index, "success": False, "error": "Redirected away from settings"}
 
         await page.wait_for_timeout(1000)
 
         in_page_mfa = await self._handle_in_page_mfa(page, password, index)
         if in_page_mfa == "failed":
-            return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
+            return {"index": index, "success": False, "error": "MFA password verification failed"}
 
         name_input = None
         for attempt in range(25):
@@ -648,8 +655,8 @@ class NetflixBrowser:
             await page.wait_for_timeout(300)
 
         if name_input is None:
-            logger.warning(f"[{index}] Name input not found on {page.url}, falling back to recreate")
-            return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
+            logger.warning(f"[{index}] Name input not found on {page.url}")
+            return {"index": index, "success": False, "error": "Name input not found"}
 
         logger.info(f"[{index}] Editing name to '{new_name}'")
         await name_input.click()
@@ -734,80 +741,79 @@ class NetflixBrowser:
             await self._safe_close(p, browser)
             return {"index": index, "success": False, "error": str(e)}
 
-    async def _recreate_profile(self, guid: str, old_name: str, new_name: str, index: int) -> dict:
-        logger.info(f"[{index}] Deleting profile '{old_name}' ({guid}) for recreate")
-        del_ok, del_msg = await self.delete_profile(guid)
-        if not del_ok:
-            return {"index": index, "success": False, "error": f"Delete failed: {del_msg}"}
-        logger.info(f"[{index}] Deleted, now adding '{new_name}'")
-        await asyncio.sleep(0.5)
-        add_result = await self._add_single_profile(new_name, index)
-        if isinstance(add_result, dict) and add_result.get("success"):
-            logger.info(f"[{index}] Recreated: {old_name} -> {new_name}")
-            return {"index": index, "success": True, "new_name": new_name}
-        error = add_result.get("error", "Failed") if isinstance(add_result, dict) else str(add_result)
-        return {"index": index, "success": False, "error": f"Recreate failed: {error}"}
-
-    async def _staggered_update(self, guid: str, new_name: str, password: str, index: int, delay: float) -> dict:
-        if delay > 0:
-            await asyncio.sleep(delay)
-        return await self._update_single_profile(guid, new_name, password, index)
-
     async def update_all_profiles_parallel(self, profiles: List[dict], new_names: List[str], password: str, progress_callback=None) -> List[dict]:
-        tasks = []
+        items = []
         for i, (profile, new_name) in enumerate(zip(profiles, new_names)):
             guid = profile.get("guid", "")
-            if not guid:
-                continue
-            tasks.append(self._staggered_update(guid, new_name, password, i, delay=i * 0.8))
+            if guid:
+                items.append((i, guid, new_name))
 
-        if not tasks:
+        if not items:
             return [{"index": i, "success": False, "error": "No GUID"} for i in range(len(profiles))]
 
-        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info(f"Renaming {len(items)} profiles sequentially (single browser)")
 
         results = [None] * len(profiles)
-        mfa_tasks = []
-        for i, r in enumerate(raw_results):
-            old_name = profiles[i].get("profileName", "Unknown")
-            if isinstance(r, Exception):
-                results[i] = {"index": i, "success": False, "error": str(r)}
-                if progress_callback:
-                    await progress_callback(i, old_name, new_names[i], False, str(r))
-            elif isinstance(r, dict) and r.get("needs_recreate"):
-                profile = profiles[i]
-                mfa_tasks.append((i, self._recreate_profile(
-                    profile.get("guid", ""), old_name, new_names[i], i
-                )))
-                results[i] = r
-                if progress_callback:
-                    await progress_callback(i, old_name, new_names[i], None, "MFA blocked - recreating...")
-            else:
-                results[i] = r if isinstance(r, dict) else {"index": i, "success": False, "error": str(r)}
-                success = isinstance(r, dict) and r.get("success", False)
-                if progress_callback:
-                    err = r.get("error", "Failed") if isinstance(r, dict) and not success else None
-                    await progress_callback(i, old_name, new_names[i], success, err)
 
-        if mfa_tasks:
-            logger.info(f"Recreating {len(mfa_tasks)} MFA-blocked profiles in parallel...")
-            recreate_results = await asyncio.gather(
-                *[task for _, task in mfa_tasks], return_exceptions=True
-            )
-            for (idx, _), recreate_r in zip(mfa_tasks, recreate_results):
+        p = None
+        browser = None
+        context = None
+
+        async def ensure_browser():
+            nonlocal p, browser, context
+            if browser is None or not browser.is_connected():
+                await self._safe_close(p, browser)
+                p, browser, context = await self._launch_browser()
+                logger.info("Launched new browser for rename batch")
+            return context
+
+        try:
+            context = await ensure_browser()
+
+            for j, (idx, guid, new_name) in enumerate(items):
+                if j > 0:
+                    await asyncio.sleep(0.5)
                 old_name = profiles[idx].get("profileName", "Unknown")
-                if isinstance(recreate_r, Exception):
-                    results[idx] = {"index": idx, "success": False, "error": str(recreate_r)}
-                    if progress_callback:
-                        await progress_callback(idx, old_name, new_names[idx], False, str(recreate_r))
-                elif isinstance(recreate_r, dict):
-                    results[idx] = recreate_r
-                    recreate_r["recreated"] = True
-                    success = recreate_r.get("success", False)
-                    if progress_callback:
-                        err = recreate_r.get("error") if not success else None
-                        label = "Recreated" if success else None
-                        await progress_callback(idx, old_name, new_names[idx], success, err, label=label)
+                page = None
+                r = None
+                for attempt in range(3):
+                    try:
+                        context = await ensure_browser()
+                        page = await context.new_page()
+                        r = await self._do_update_profile(page, guid, new_name, password, idx)
+                    except Exception as e:
+                        logger.error(f"[{idx}] Rename error (attempt {attempt+1}): {e}")
+                        r = {"index": idx, "success": False, "error": str(e)}
+                    finally:
+                        if page:
+                            try:
+                                await page.close()
+                            except:
+                                pass
+                            page = None
+
+                    if isinstance(r, dict) and r.get("success"):
+                        break
+                    if attempt < 2:
+                        logger.info(f"[{idx}] Retrying rename (attempt {attempt+2}/3)...")
+                        await asyncio.sleep(1)
+
+                if r is None:
+                    r = {"index": idx, "success": False, "error": "All attempts failed"}
+                results[idx] = r
+                if progress_callback:
+                    success = isinstance(r, dict) and r.get("success", False)
+                    error = r.get("error") if isinstance(r, dict) and not success else None
+                    await progress_callback(idx, old_name, new_name, success, error)
+
+            await self._safe_close(p, browser)
+        except Exception as e:
+            logger.error(f"Browser-level error in rename batch: {e}")
+            await self._safe_close(p, browser)
+
+        for i in range(len(profiles)):
+            if results[i] is None:
+                results[i] = {"index": i, "success": False, "error": "Worker failed"}
 
         return results
 
@@ -1747,9 +1753,7 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
             await safe_edit(msg, await build_progress_text())
 
             async def on_progress(idx, old_name, new_name, success, error, label=None):
-                if success is None:
-                    progress_lines[idx] = f"... {idx+1}. {old_name} -> {new_name} (recreating...)"
-                elif success:
+                if success:
                     tag = f" [{label}]" if label else ""
                     progress_lines[idx] = f"OK {idx+1}. {old_name} -> {new_name}{tag}"
                 else:
@@ -1769,12 +1773,9 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
                 old_name = profile.get("profileName", "Unknown")
                 new_name = update_names[i]
                 if isinstance(result, dict) and result.get("success"):
-                    tag = " [Recreated]" if result.get("recreated") else ""
-                    results.append(f"OK {i+1}. {old_name} -> {new_name}{tag}")
+                    results.append(f"OK {i+1}. {old_name} -> {new_name}")
                 else:
                     error = result.get("error", "Failed") if isinstance(result, dict) else str(result)
-                    if error == "MFA_BLOCKED":
-                        error = "MFA blocked"
                     results.append(f"FAIL {i+1}. {old_name} -> {new_name} ({error})")
 
             name_idx = regular_to_update
