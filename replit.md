@@ -46,8 +46,9 @@ A Telegram bot that automates Netflix profile management using Playwright browse
 - Netflix selectors use multiple fallback patterns for robustness
 - Browser lifecycle centralized via `_launch_browser()` and `_safe_close()` methods
 - Profile data fetched via HTTP (httpx) for speed; browser automation only for mutations
-- **Sequential processing**: Both profile updates and PIN sets run sequentially (not parallel) to avoid Netflix MFA conflicts
-- **MFA handling**: PIN changes accept password via MFA; profile name edits on locked profiles trigger MFA without password option, so the bot uses a **delete+recreate fallback** (deletes old profile, creates new one with desired name)
+- **Parallel processing**: Profile updates and PIN sets run in parallel using separate browser instances (5 profiles in ~20s for renames, ~16s for PINs)
+- **PIN parallelism**: PINs split across up to 3 parallel browser workers, each handling a subset sequentially
+- **MFA handling**: PIN changes accept password via MFA; profile name edits on locked profiles trigger MFA without password option, so the bot uses a **delete+recreate fallback** (deletes old profile, creates new one with desired name) - recreates also run in parallel
 - **Smart waiting**: Uses polling (250-500ms intervals) instead of fixed delays for faster operations
 
 ## Running

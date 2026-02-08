@@ -617,55 +617,59 @@ class NetflixBrowser:
             await self._safe_close(p, browser)
             return {"index": index, "success": False, "error": str(e)}
 
+    async def _recreate_profile(self, guid: str, old_name: str, new_name: str, index: int) -> dict:
+        logger.info(f"[{index}] Deleting profile '{old_name}' ({guid}) for recreate")
+        del_ok, del_msg = await self.delete_profile(guid)
+        if not del_ok:
+            return {"index": index, "success": False, "error": f"Delete failed: {del_msg}"}
+        logger.info(f"[{index}] Deleted, now adding '{new_name}'")
+        await asyncio.sleep(0.5)
+        add_result = await self._add_single_profile(new_name, index)
+        if isinstance(add_result, dict) and add_result.get("success"):
+            logger.info(f"[{index}] Recreated: {old_name} -> {new_name}")
+            return {"index": index, "success": True, "new_name": new_name}
+        error = add_result.get("error", "Failed") if isinstance(add_result, dict) else str(add_result)
+        return {"index": index, "success": False, "error": f"Recreate failed: {error}"}
+
     async def update_all_profiles_parallel(self, profiles: List[dict], new_names: List[str], password: str) -> List[dict]:
-        p = None
-        browser = None
-        try:
-            p, browser, context = await self._launch_browser()
-            page = await context.new_page()
+        tasks = []
+        for i, (profile, new_name) in enumerate(zip(profiles, new_names)):
+            guid = profile.get("guid", "")
+            if not guid:
+                continue
+            tasks.append(self._update_single_profile(guid, new_name, password, i))
 
-            results = []
-            mfa_blocked = []
-            for i, (profile, new_name) in enumerate(zip(profiles, new_names)):
-                guid = profile.get("guid", "")
-                if not guid:
-                    results.append({"index": i, "success": False, "error": "No GUID"})
-                    continue
-                result = await self._update_profile_on_page(page, guid, new_name, password, i)
-                if isinstance(result, dict) and result.get("needs_recreate"):
-                    mfa_blocked.append((i, profile, new_name))
-                    results.append(result)
-                else:
-                    results.append(result)
+        if not tasks:
+            return [{"index": i, "success": False, "error": "No GUID"} for i in range(len(profiles))]
 
-            await self._safe_close(p, browser)
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            if mfa_blocked:
-                logger.info(f"Recreating {len(mfa_blocked)} MFA-blocked profiles...")
-                for idx, profile, new_name in mfa_blocked:
-                    guid = profile.get("guid", "")
-                    old_name = profile.get("profileName", "Unknown")
-                    logger.info(f"[{idx}] Deleting profile '{old_name}' ({guid}) for recreate")
-                    del_ok, del_msg = await self.delete_profile(guid)
-                    if del_ok:
-                        logger.info(f"[{idx}] Deleted, now adding '{new_name}'")
-                        await asyncio.sleep(1)
-                        add_result = await self._add_single_profile(new_name, idx)
-                        if isinstance(add_result, dict) and add_result.get("success"):
-                            results[idx] = {"index": idx, "success": True, "new_name": new_name}
-                            logger.info(f"[{idx}] Recreated: {old_name} -> {new_name}")
-                        else:
-                            error = add_result.get("error", "Failed") if isinstance(add_result, dict) else str(add_result)
-                            results[idx] = {"index": idx, "success": False, "error": f"Recreate failed: {error}"}
-                    else:
-                        results[idx] = {"index": idx, "success": False, "error": f"Delete failed: {del_msg}"}
+        results = [None] * len(profiles)
+        mfa_tasks = []
+        for i, r in enumerate(raw_results):
+            if isinstance(r, Exception):
+                results[i] = {"index": i, "success": False, "error": str(r)}
+            elif isinstance(r, dict) and r.get("needs_recreate"):
+                profile = profiles[i]
+                mfa_tasks.append((i, self._recreate_profile(
+                    profile.get("guid", ""), profile.get("profileName", "Unknown"), new_names[i], i
+                )))
+                results[i] = r
+            else:
+                results[i] = r if isinstance(r, dict) else {"index": i, "success": False, "error": str(r)}
 
-            return results
+        if mfa_tasks:
+            logger.info(f"Recreating {len(mfa_tasks)} MFA-blocked profiles in parallel...")
+            recreate_results = await asyncio.gather(
+                *[task for _, task in mfa_tasks], return_exceptions=True
+            )
+            for (idx, _), recreate_r in zip(mfa_tasks, recreate_results):
+                if isinstance(recreate_r, Exception):
+                    results[idx] = {"index": idx, "success": False, "error": str(recreate_r)}
+                elif isinstance(recreate_r, dict):
+                    results[idx] = recreate_r
 
-        except Exception as e:
-            logger.error(f"Sequential update error: {e}")
-            await self._safe_close(p, browser)
-            return [{"index": i, "success": False, "error": str(e)} for i in range(len(profiles))]
+        return results
 
     async def _set_pin_on_page(self, page: Page, guid: str, pin: str, password: str, index: int) -> dict:
         try:
@@ -804,29 +808,57 @@ class NetflixBrowser:
             logger.error(f"[{index}] Set PIN error: {e}")
             return {"index": index, "success": False, "error": str(e)}
 
-    async def set_all_pins_parallel(self, profiles: List[dict], pins: List[str], password: str) -> List[dict]:
+    async def _set_pins_batch(self, batch: List[tuple], password: str) -> List[dict]:
         p = None
         browser = None
         try:
             p, browser, context = await self._launch_browser()
             page = await context.new_page()
-
             results = []
-            for i, (profile, pin) in enumerate(zip(profiles, pins)):
-                guid = profile.get("guid", "")
-                if not guid:
-                    results.append({"index": i, "success": False, "error": "No GUID"})
-                    continue
-                result = await self._set_pin_on_page(page, guid, pin, password, i)
+            for idx, guid, pin in batch:
+                result = await self._set_pin_on_page(page, guid, pin, password, idx)
                 results.append(result)
-
             await self._safe_close(p, browser)
             return results
-
         except Exception as e:
-            logger.error(f"Sequential PIN error: {e}")
+            logger.error(f"PIN batch error: {e}")
             await self._safe_close(p, browser)
-            return [{"index": i, "success": False, "error": str(e)} for i in range(len(profiles))]
+            return [{"index": idx, "success": False, "error": str(e)} for idx, _, _ in batch]
+
+    async def set_all_pins_parallel(self, profiles: List[dict], pins: List[str], password: str) -> List[dict]:
+        items = []
+        for i, (profile, pin) in enumerate(zip(profiles, pins)):
+            guid = profile.get("guid", "")
+            if guid:
+                items.append((i, guid, pin))
+
+        if not items:
+            return [{"index": i, "success": False, "error": "No GUID"} for i in range(len(profiles))]
+
+        n_workers = min(3, len(items))
+        batches = [[] for _ in range(n_workers)]
+        for j, item in enumerate(items):
+            batches[j % n_workers].append(item)
+
+        logger.info(f"Setting PINs: {len(items)} profiles across {n_workers} parallel workers")
+        batch_results = await asyncio.gather(
+            *[self._set_pins_batch(batch, password) for batch in batches],
+            return_exceptions=True
+        )
+
+        results = [None] * len(profiles)
+        for br in batch_results:
+            if isinstance(br, Exception):
+                continue
+            for r in br:
+                if isinstance(r, dict) and "index" in r:
+                    results[r["index"]] = r
+
+        for i in range(len(profiles)):
+            if results[i] is None:
+                results[i] = {"index": i, "success": False, "error": "Worker failed"}
+
+        return results
 
     async def _delete_profile_lock(self, guid: str, password: str, index: int) -> dict:
         p = None
