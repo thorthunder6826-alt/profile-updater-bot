@@ -223,23 +223,25 @@ class NetflixBrowser:
                 return False, "Email input not found on login page", ""
 
             logger.info("Found email input, typing email...")
-            await email_input.click()
-            await email_input.fill("")
-            await email_input.type(email, delay=20)
+            await email_input.click(force=True, timeout=5000)
+            await email_input.fill(email)
             await page.wait_for_timeout(300)
 
             submit_btn = page.locator("button[type='submit']").first
             if await submit_btn.count() > 0:
-                await submit_btn.click()
+                await submit_btn.click(force=True, timeout=5000)
                 logger.info("Clicked submit/continue button")
 
             pwd_input = None
-            for _ in range(15):
-                for sel in ["input[name='password']", "input[type='password']", "input[autocomplete='current-password']"]:
+            for _ in range(20):
+                for sel in ["input[name='password']", "input[type='password']", "input[autocomplete='current-password']", "input[data-uia='field-password']"]:
                     el = page.locator(sel).first
-                    if await el.count() > 0 and await el.is_visible():
-                        pwd_input = el
-                        break
+                    try:
+                        if await el.count() > 0:
+                            pwd_input = el
+                            break
+                    except:
+                        pass
                 if pwd_input:
                     break
                 await page.wait_for_timeout(300)
@@ -254,15 +256,15 @@ class NetflixBrowser:
                 await cleanup()
                 return False, "Password field not found — email may be invalid", ""
 
-            logger.info("Found password input, typing password...")
-            await pwd_input.click()
-            await pwd_input.fill("")
-            await pwd_input.type(password, delay=20)
+            logger.info("Found password input, filling password...")
+            await page.wait_for_timeout(500)
+            await pwd_input.click(force=True, timeout=5000)
+            await pwd_input.fill(password)
             await page.wait_for_timeout(300)
 
             sign_in_btn = page.locator("button[type='submit']").first
             if await sign_in_btn.count() > 0:
-                await sign_in_btn.click()
+                await sign_in_btn.click(force=True, timeout=5000)
                 logger.info("Clicked sign-in button")
             else:
                 await page.keyboard.press("Enter")
