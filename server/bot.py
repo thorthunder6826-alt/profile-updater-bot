@@ -379,11 +379,11 @@ class NetflixBrowser:
             logger.error(f"Get profiles error: {e}")
             return False, f"Error: {str(e)}"
 
-    async def _update_profile_on_page(self, page: Page, guid: str, new_name: str, index: int) -> dict:
+    async def _update_profile_on_page(self, page: Page, guid: str, new_name: str, password: str, index: int) -> dict:
         try:
             return await asyncio.wait_for(
-                self._do_update_profile(page, guid, new_name, index),
-                timeout=45.0
+                self._do_update_profile(page, guid, new_name, password, index),
+                timeout=60.0
             )
         except asyncio.TimeoutError:
             logger.error(f"[{index}] Profile update timed out for {guid}")
@@ -392,7 +392,105 @@ class NetflixBrowser:
             logger.error(f"[{index}] Update profile error: {e}")
             return {"index": index, "success": False, "error": str(e)}
 
-    async def _do_update_profile(self, page: Page, guid: str, new_name: str, index: int) -> dict:
+    async def _handle_mfa_if_needed(self, page: Page, password: str, target_url: str, index: int) -> bool:
+        if "/mfa" not in page.url.lower():
+            return True
+
+        logger.info(f"[{index}] MFA page detected: {page.url}")
+
+        confirm_clicked = False
+        for t in range(60):
+            pwd_input = page.locator("input[type='password']:visible").first
+            if await pwd_input.count() > 0:
+                await pwd_input.fill(password)
+                logger.info(f"[{index}] MFA: entered password")
+
+                for s in ["button:has-text('Submit')", "button[type='submit']", "button:has-text('Continue')"]:
+                    btn = page.locator(s).first
+                    if await btn.count() > 0 and await btn.is_visible():
+                        await btn.click()
+                        break
+
+                for w in range(40):
+                    await page.wait_for_timeout(250)
+                    if "/mfa" not in page.url.lower():
+                        logger.info(f"[{index}] MFA: passed -> {page.url}")
+                        if target_url and target_url not in page.url:
+                            logger.info(f"[{index}] MFA: redirecting to {target_url}")
+                            await page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                        return True
+                    wrong = await page.locator("text=Incorrect password").count() + \
+                            await page.locator("text=Wrong password").count()
+                    if wrong > 0:
+                        logger.error(f"[{index}] MFA: incorrect password")
+                        return False
+                if "/mfa" not in page.url.lower():
+                    if target_url and target_url not in page.url:
+                        await page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                    return True
+                return False
+
+            if not confirm_clicked:
+                confirm = page.locator("button:has-text('Confirm password')").first
+                if await confirm.count() > 0:
+                    await confirm.click()
+                    confirm_clicked = True
+                    logger.info(f"[{index}] MFA: clicked Confirm password")
+                    await page.wait_for_timeout(2000)
+                    continue
+
+            err = await page.locator("text=Looks like something went wrong").count()
+            if err > 0:
+                logger.warning(f"[{index}] MFA: error page, navigating to target")
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                if "/mfa" not in page.url.lower():
+                    return True
+                confirm_clicked = False
+
+            await page.wait_for_timeout(500)
+
+        logger.error(f"[{index}] MFA: timed out")
+        return False
+
+    async def _click_name_link(self, page: Page, old_name: str, index: int) -> bool:
+        name_link_selectors = [
+            f"a:has-text('{old_name}')" if old_name else None,
+            "a:has-text('Edit personal')",
+            "a:has-text('personal and contact')",
+            "a:has-text('Edit profile')",
+        ]
+
+        for selector in name_link_selectors:
+            if not selector:
+                continue
+            try:
+                el = page.locator(selector).first
+                if await el.count() > 0 and await el.is_visible():
+                    await el.click()
+                    logger.info(f"[{index}] Clicked name link: {selector}")
+                    return True
+            except:
+                pass
+
+        all_links = await page.locator("a:visible, button:visible, [role='button']:visible, [role='link']:visible").all()
+        for link in all_links:
+            text = ""
+            try:
+                text = (await link.inner_text()).strip()
+            except:
+                pass
+            if old_name and old_name.lower() in text.lower():
+                await link.click()
+                logger.info(f"[{index}] Clicked element with profile name text")
+                return True
+            if "edit personal" in text.lower() or "personal and contact" in text.lower():
+                await link.click()
+                logger.info(f"[{index}] Clicked 'Edit personal' link")
+                return True
+
+        return False
+
+    async def _do_update_profile(self, page: Page, guid: str, new_name: str, password: str, index: int) -> dict:
         logger.info(f"[{index}] Updating profile: {guid} -> {new_name}")
 
         old_name = None
@@ -401,102 +499,50 @@ class NetflixBrowser:
                 old_name = p.get("profileName", "")
                 break
 
-        try:
-            settings_url = f"https://www.netflix.com/settings/{guid}"
-            await page.goto(settings_url, wait_until="domcontentloaded", timeout=20000)
-        except Exception as nav_err:
-            return {"index": index, "success": False, "error": f"Navigation failed: {short_error(nav_err)}"}
+        settings_url = f"https://www.netflix.com/settings/{guid}"
 
-        if "login" in page.url.lower():
-            return {"index": index, "success": False, "error": "Session expired"}
+        for attempt in range(2):
+            try:
+                await page.goto(settings_url, wait_until="domcontentloaded", timeout=20000)
+            except Exception as nav_err:
+                return {"index": index, "success": False, "error": f"Navigation failed: {short_error(nav_err)}"}
+
+            if "login" in page.url.lower():
+                return {"index": index, "success": False, "error": "Session expired"}
+
+            if "/mfa" in page.url.lower():
+                mfa_ok = await self._handle_mfa_if_needed(page, password, settings_url, index)
+                if not mfa_ok:
+                    return {"index": index, "success": False, "error": "MFA verification failed"}
+
+            if "/settings/" in page.url and "/mfa" not in page.url:
+                break
 
         logger.info(f"[{index}] On settings page: {page.url}")
 
-        name_link_selectors = [
-            f"a:has-text('{old_name}')" if old_name else None,
-            "a:has-text('Edit personal')",
-            "a:has-text('personal and contact')",
-            "a:has-text('Edit profile')",
-        ]
-
-        clicked_name = False
-        for selector in name_link_selectors:
-            if not selector:
-                continue
-            try:
-                el = page.locator(selector).first
-                if await el.count() > 0 and await el.is_visible():
-                    await el.click()
-                    clicked_name = True
-                    logger.info(f"[{index}] Step 2: Clicked name link: {selector}")
-                    break
-            except Exception as e:
-                logger.info(f"[{index}] Selector {selector} failed: {short_error(e)}")
-
+        clicked_name = await self._click_name_link(page, old_name, index)
         if not clicked_name:
-            all_links = await page.locator("a:visible, button:visible, [role='button']:visible, [role='link']:visible").all()
-            logger.info(f"[{index}] Looking for name link among {len(all_links)} elements")
-            for i, link in enumerate(all_links):
-                text = ""
-                try:
-                    text = (await link.inner_text()).strip()
-                except:
-                    pass
-                href = await link.get_attribute("href") or ""
-                logger.info(f"[{index}] link[{i}]: text='{text[:80]}' href='{href[:80]}'")
-                if old_name and old_name.lower() in text.lower():
-                    await link.click()
-                    clicked_name = True
-                    logger.info(f"[{index}] Step 2: Clicked element with profile name text at index {i}")
-                    break
-                if "edit personal" in text.lower() or "personal and contact" in text.lower():
-                    await link.click()
-                    clicked_name = True
-                    logger.info(f"[{index}] Step 2: Clicked 'Edit personal' link at index {i}")
-                    break
+            return {"index": index, "success": False, "error": "Could not find profile name link"}
 
-        if not clicked_name:
-            clickable_sections = await page.locator("div[class*='profile'], section, li, [class*='section']").all()
-            for i, sec in enumerate(clickable_sections[:15]):
-                text = ""
-                try:
-                    text = (await sec.inner_text()).strip()
-                except:
-                    pass
-                if old_name and old_name.lower() in text.lower() and "edit" in text.lower():
-                    await sec.click()
-                    clicked_name = True
-                    logger.info(f"[{index}] Step 2: Clicked section with name at index {i}")
-                    break
-
-        if not clicked_name:
-            return {"index": index, "success": False, "error": "Could not find profile name link on settings page"}
+        if "/mfa" in page.url.lower():
+            logger.info(f"[{index}] MFA triggered for profile edit - using delete+recreate fallback")
+            return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
 
         name_input = None
-        for attempt in range(20):
+        for attempt in range(25):
             name_input = await self._try_find_name_input(page, index)
             if name_input:
                 break
             await page.wait_for_timeout(300)
 
         if name_input is None:
-            try:
-                await page.screenshot(path=f"/tmp/debug_edit_page_{index}.png")
-                html = await page.content()
-                with open(f"/tmp/debug_edit_page_{index}.html", "w") as f:
-                    f.write(html)
-            except:
-                pass
-            return {"index": index, "success": False, "error": f"Name input not found on edit page {page.url}"}
+            return {"index": index, "success": False, "error": f"Name input not found on {page.url}"}
 
         logger.info(f"[{index}] Editing name to '{new_name}'")
         await name_input.click()
         await name_input.press("Control+a")
         await name_input.fill("")
         await name_input.type(new_name, delay=20)
-
-        current_val = await name_input.input_value()
-        logger.info(f"[{index}] Input value after typing: '{current_val}'")
 
         save_selectors = [
             "button:has-text('Save')",
@@ -505,17 +551,12 @@ class NetflixBrowser:
             "button:has-text('Done')",
         ]
 
-        save_clicked = False
         for selector in save_selectors:
             el = page.locator(selector).first
             if await el.count() > 0 and await el.is_visible():
                 await el.click()
-                save_clicked = True
-                logger.info(f"[{index}] Step 5: Clicked save: {selector}")
+                logger.info(f"[{index}] Clicked save: {selector}")
                 break
-
-        if not save_clicked:
-            await page.keyboard.press("Enter")
 
         await page.wait_for_timeout(1500)
         logger.info(f"[{index}] Profile updated: {new_name}")
@@ -563,63 +604,66 @@ class NetflixBrowser:
 
         return None
 
-    async def _update_single_profile(self, guid: str, new_name: str, index: int) -> dict:
+    async def _update_single_profile(self, guid: str, new_name: str, password: str, index: int) -> dict:
         p = None
         browser = None
         try:
             p, browser, context = await self._launch_browser()
             page = await context.new_page()
-            result = await self._update_profile_on_page(page, guid, new_name, index)
+            result = await self._update_profile_on_page(page, guid, new_name, password, index)
             await self._safe_close(p, browser)
             return result
         except Exception as e:
             await self._safe_close(p, browser)
             return {"index": index, "success": False, "error": str(e)}
 
-    async def update_all_profiles_parallel(self, profiles: List[dict], new_names: List[str]) -> List[dict]:
+    async def update_all_profiles_parallel(self, profiles: List[dict], new_names: List[str], password: str) -> List[dict]:
         p = None
         browser = None
         try:
             p, browser, context = await self._launch_browser()
+            page = await context.new_page()
 
-            pages = []
-            for _ in profiles:
-                pages.append(await context.new_page())
-
-            tasks = []
-            for i, (profile, new_name, page) in enumerate(zip(profiles, new_names, pages)):
+            results = []
+            mfa_blocked = []
+            for i, (profile, new_name) in enumerate(zip(profiles, new_names)):
                 guid = profile.get("guid", "")
-                if guid:
-                    tasks.append(self._update_profile_on_page(page, guid, new_name, i))
-
-            if not tasks:
-                await self._safe_close(p, browser)
-                return []
-
-            try:
-                results = await asyncio.wait_for(
-                    asyncio.gather(*tasks, return_exceptions=True),
-                    timeout=120.0
-                )
-            except asyncio.TimeoutError:
-                logger.error("Overall parallel update timed out after 120s")
-                await self._safe_close(p, browser)
-                return [{"index": i, "success": False, "error": "Overall timeout"} for i in range(len(profiles))]
-
-            processed = []
-            for i, r in enumerate(results):
-                if isinstance(r, Exception):
-                    processed.append({"index": i, "success": False, "error": str(r)})
-                elif isinstance(r, dict):
-                    processed.append(r)
+                if not guid:
+                    results.append({"index": i, "success": False, "error": "No GUID"})
+                    continue
+                result = await self._update_profile_on_page(page, guid, new_name, password, i)
+                if isinstance(result, dict) and result.get("needs_recreate"):
+                    mfa_blocked.append((i, profile, new_name))
+                    results.append(result)
                 else:
-                    processed.append({"index": i, "success": False, "error": f"Unexpected result: {r}"})
+                    results.append(result)
 
             await self._safe_close(p, browser)
-            return processed
+
+            if mfa_blocked:
+                logger.info(f"Recreating {len(mfa_blocked)} MFA-blocked profiles...")
+                for idx, profile, new_name in mfa_blocked:
+                    guid = profile.get("guid", "")
+                    old_name = profile.get("profileName", "Unknown")
+                    logger.info(f"[{idx}] Deleting profile '{old_name}' ({guid}) for recreate")
+                    del_ok, del_msg = await self.delete_profile(guid)
+                    if del_ok:
+                        logger.info(f"[{idx}] Deleted, now adding '{new_name}'")
+                        await asyncio.sleep(1)
+                        add_result = await self._add_single_profile(new_name, idx)
+                        if isinstance(add_result, dict) and add_result.get("success"):
+                            results[idx] = {"index": idx, "success": True, "new_name": new_name}
+                            logger.info(f"[{idx}] Recreated: {old_name} -> {new_name}")
+                        else:
+                            error = add_result.get("error", "Failed") if isinstance(add_result, dict) else str(add_result)
+                            results[idx] = {"index": idx, "success": False, "error": f"Recreate failed: {error}"}
+                    else:
+                        results[idx] = {"index": idx, "success": False, "error": f"Delete failed: {del_msg}"}
+
+            return results
 
         except Exception as e:
-            logger.error(f"Parallel update error: {e}")
+            logger.error(f"Sequential update error: {e}")
             await self._safe_close(p, browser)
             return [{"index": i, "success": False, "error": str(e)} for i in range(len(profiles))]
 
@@ -792,32 +836,44 @@ class NetflixBrowser:
             page = await context.new_page()
 
             await page.goto(f"https://www.netflix.com/settings/lock/{guid}", wait_until="domcontentloaded")
-            await page.wait_for_timeout(2000)
 
-            if "login" in page.url.lower():
-                await self._safe_close(p, browser)
-                return {"index": index, "success": False, "error": "Session expired"}
+            for _ in range(10):
+                if "login" in page.url.lower():
+                    await self._safe_close(p, browser)
+                    return {"index": index, "success": False, "error": "Session expired"}
+                delete_btn = page.locator("button:has-text('Delete Profile Lock'), button:has-text('Remove Lock')").first
+                if await delete_btn.count() > 0:
+                    break
+                no_lock = page.locator("text=Profile Lock PIN, input[type='password']").first
+                if await no_lock.count() == 0 and await page.locator("text=Create Lock").count() > 0:
+                    await self._safe_close(p, browser)
+                    return {"index": index, "success": True, "message": "No lock"}
+                await page.wait_for_timeout(500)
 
-            delete_btn = page.locator("button:has-text('Delete Profile Lock')").first
-            if await delete_btn.count() == 0:
-                delete_btn = page.locator("button:has-text('Remove Lock')").first
+            delete_btn = page.locator("button:has-text('Delete Profile Lock'), button:has-text('Remove Lock')").first
             if await delete_btn.count() == 0:
                 await self._safe_close(p, browser)
                 return {"index": index, "success": True, "message": "No lock to delete"}
 
             await delete_btn.click(force=True)
-            await page.wait_for_timeout(2000)
 
-            pwd_input = page.locator("input[type='password']:visible").first
-            if await pwd_input.count() > 0:
-                await pwd_input.fill(password)
+            for _ in range(20):
+                pwd_input = page.locator("input[type='password']:visible").first
+                if await pwd_input.count() > 0:
+                    await pwd_input.fill(password)
+                    await page.wait_for_timeout(200)
+                    await page.keyboard.press("Enter")
+
+                    for _ in range(20):
+                        await page.wait_for_timeout(300)
+                        if await page.locator("text=Incorrect password").count() > 0:
+                            await self._safe_close(p, browser)
+                            return {"index": index, "success": False, "error": "Incorrect password"}
+                        if await page.locator("button:has-text('Delete Profile Lock'), button:has-text('Remove Lock')").count() == 0:
+                            await self._safe_close(p, browser)
+                            return {"index": index, "success": True, "message": "Lock deleted"}
+                    break
                 await page.wait_for_timeout(300)
-                await page.keyboard.press("Enter")
-                await page.wait_for_timeout(2500)
-
-                if await page.locator("text=Incorrect password").count() > 0:
-                    await self._safe_close(p, browser)
-                    return {"index": index, "success": False, "error": "Incorrect password"}
 
             await self._safe_close(p, browser)
             return {"index": index, "success": True, "message": "Lock deleted"}
@@ -827,22 +883,15 @@ class NetflixBrowser:
             return {"index": index, "success": False, "error": str(e)}
 
     async def delete_all_profile_locks(self, profiles: List[dict], password: str) -> List[dict]:
-        tasks = []
+        processed = []
         for i, profile in enumerate(profiles):
             guid = profile.get("guid", "")
             if guid:
-                tasks.append(self._delete_profile_lock(guid, password, i))
-        if not tasks:
-            return []
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        processed = []
-        for i, r in enumerate(results):
-            if isinstance(r, Exception):
-                processed.append({"index": i, "success": False, "error": str(r)})
-            elif isinstance(r, dict):
-                processed.append(r)
-            else:
-                processed.append({"index": i, "success": False, "error": str(r)})
+                try:
+                    r = await self._delete_profile_lock(guid, password, i)
+                    processed.append(r if isinstance(r, dict) else {"index": i, "success": False, "error": str(r)})
+                except Exception as e:
+                    processed.append({"index": i, "success": False, "error": str(e)})
         return processed
 
     async def _add_single_profile(self, name: str, index: int) -> dict:
@@ -956,8 +1005,8 @@ class NetflixBrowser:
             await self._safe_close(p, browser)
             return None
 
-    async def update_profile(self, guid: str, new_name: str) -> tuple:
-        result = await self._update_single_profile(guid, new_name, 0)
+    async def update_profile(self, guid: str, new_name: str, password: str = "") -> tuple:
+        result = await self._update_single_profile(guid, new_name, password, 0)
         if result.get("success"):
             return True, f"Profile updated to '{new_name}'!"
         return False, result.get("error", "Unknown error")
@@ -1250,12 +1299,6 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
 
         need_to_add = names_count > existing_count
 
-        if need_to_add and profiles:
-            await safe_edit(msg, "Removing profile locks first...")
-            lock_results = await netflix.delete_all_profile_locks(profiles, password)
-            deleted_locks = sum(1 for r in lock_results if isinstance(r, dict) and r.get("success"))
-            logger.info(f"Deleted {deleted_locks}/{len(profiles)} profile locks")
-
         info_text = f"Found {existing_count} profiles"
         if kids_count > 0:
             info_text += f" ({kids_count} Kids)"
@@ -1268,11 +1311,11 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
 
         regular_to_update = min(len(regular_profiles), names_count)
         if regular_to_update > 0:
-            await safe_edit(msg, f"Updating {regular_to_update} regular profiles in parallel...")
+            await safe_edit(msg, f"Updating {regular_to_update} profiles (MFA-blocked ones will be recreated)...")
 
             update_profiles = regular_profiles[:regular_to_update]
             update_names = new_names[:regular_to_update]
-            update_results = await netflix.update_all_profiles_parallel(update_profiles, update_names)
+            update_results = await netflix.update_all_profiles_parallel(update_profiles, update_names, password)
 
             for i, (profile, result) in enumerate(zip(update_profiles, update_results)):
                 old_name = profile.get("profileName", "Unknown")

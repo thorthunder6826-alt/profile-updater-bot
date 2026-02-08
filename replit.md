@@ -42,11 +42,13 @@ A Telegram bot that automates Netflix profile management using Playwright browse
 
 ## Technical Notes
 - Chromium launched with `--no-sandbox`, `--disable-dev-shm-usage`, `--disable-gpu` flags for Replit environment
-- Per-task timeout: 45s for each profile update/PIN set operation
-- Overall timeout: 120s for parallel operations (updateallprofiles, updateallpins)
+- Per-task timeout: 60s for profile update, 90s for PIN set
 - Netflix selectors use multiple fallback patterns for robustness
 - Browser lifecycle centralized via `_launch_browser()` and `_safe_close()` methods
 - Profile data fetched via HTTP (httpx) for speed; browser automation only for mutations
+- **Sequential processing**: Both profile updates and PIN sets run sequentially (not parallel) to avoid Netflix MFA conflicts
+- **MFA handling**: PIN changes accept password via MFA; profile name edits on locked profiles trigger MFA without password option, so the bot uses a **delete+recreate fallback** (deletes old profile, creates new one with desired name)
+- **Smart waiting**: Uses polling (250-500ms intervals) instead of fixed delays for faster operations
 
 ## Running
 The `Start application` workflow runs `npm run dev` which starts both the Express server and the Python bot.
