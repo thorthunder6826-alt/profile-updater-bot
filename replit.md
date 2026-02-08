@@ -46,11 +46,12 @@ A Telegram bot that automates Netflix profile management using Playwright browse
 - Browser lifecycle centralized via `_launch_browser()` and `_safe_close()` methods
 - Profile data fetched via HTTP (httpx) for speed; browser automation only for mutations
 - **CRITICAL: Never use `asyncio.wait_for()` around Playwright page operations** - it creates task cancellation pressure that disrupts Playwright's internal event loop, causing MFA dialogs to fail silently. Call `_do_set_pin()` directly instead.
-- **Parallel processing**: Profile updates and PIN sets run in parallel using separate browser instances (5 profiles in ~20s for renames, ~42s for PINs)
-- **PIN parallelism**: Max 2 concurrent browser workers with 2-second stagger between launches, controlled by asyncio.Semaphore
-- **MFA handling**: PIN changes require password via MFA dialog - click "Edit PIN" → "Confirm password" (force=True) → fill password → submit → fill PIN → save. Entire flow retries up to 3 times if MFA dialog doesn't render.
+- **CRITICAL: PIN setting MUST be sequential** - Netflix's MFA system is per-account, not per-profile. Running two MFA flows simultaneously causes one to fail (password dialog never appears). PINs run one-at-a-time with 1.5s delays between profiles.
+- **CRITICAL: Netflix rate-limits MFA** - Too many MFA attempts in rapid succession causes "something went wrong" error. The code detects this and uses exponential backoff on retries. Any failed PINs get an automatic retry pass after a 3s cooldown.
+- **Parallel processing**: Profile renames run in parallel (5 profiles in ~20s). PINs run sequentially (~10-12s per profile, ~55-70s for 5 profiles).
+- **MFA handling**: PIN changes require password via MFA dialog - click "Edit PIN" → wait for dialog → "Confirm password" (force=True) → fill password → submit → fill PIN → save. Entire flow retries up to 3 times with increasing backoff if MFA dialog fails.
 - **Profile rename MFA**: Profile name edits on locked profiles trigger MFA without password option, so the bot uses a **delete+recreate fallback** (deletes old profile, creates new one with desired name) - recreates also run in parallel
-- **Smart waiting**: Uses polling (250-500ms intervals) instead of fixed delays for faster operations
+- **Smart waiting**: Uses polling (250-300ms intervals) instead of fixed delays for faster operations
 
 ## Running
 The `Start application` workflow runs `npm run dev` which starts both the Express server and the Python bot.

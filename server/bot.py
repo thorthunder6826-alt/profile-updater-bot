@@ -381,13 +381,7 @@ class NetflixBrowser:
 
     async def _update_profile_on_page(self, page: Page, guid: str, new_name: str, password: str, index: int) -> dict:
         try:
-            return await asyncio.wait_for(
-                self._do_update_profile(page, guid, new_name, password, index),
-                timeout=60.0
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"[{index}] Profile update timed out for {guid}")
-            return {"index": index, "success": False, "error": "Timed out after 45s"}
+            return await self._do_update_profile(page, guid, new_name, password, index)
         except Exception as e:
             logger.error(f"[{index}] Update profile error: {e}")
             return {"index": index, "success": False, "error": str(e)}
@@ -731,11 +725,8 @@ class NetflixBrowser:
                     return {"index": index, "success": False, "error": "Session expired"}
 
                 if "/browse" in page.url.lower() or "/profilesgate" in page.url.lower():
-                    logger.warning(f"[{index}] PIN: Redirected to {page.url}, retrying...")
                     await page.wait_for_timeout(2000 * (attempt + 1))
                     continue
-
-                await page.wait_for_timeout(2000)
 
                 pin_btn_selectors = [
                     "button:has-text('Edit PIN')",
@@ -746,7 +737,7 @@ class NetflixBrowser:
                 ]
 
                 btn_clicked = False
-                for retry in range(8):
+                for retry in range(12):
                     for selector in pin_btn_selectors:
                         el = page.locator(selector).first
                         if await el.count() > 0 and await el.is_visible():
@@ -756,49 +747,58 @@ class NetflixBrowser:
                             break
                     if btn_clicked:
                         break
-                    await page.wait_for_timeout(500)
+                    await page.wait_for_timeout(300)
 
                 if not btn_clicked:
+                    if attempt < 2:
+                        continue
                     return {"index": index, "success": False, "error": "No Edit PIN / Create Lock button found"}
 
                 await page.wait_for_timeout(2000)
 
                 if "pinentry" in page.url.lower():
-                    logger.info(f"[{index}] Direct to PIN entry page (no MFA)")
                     break
 
                 pin_input = page.locator("input[name='PIN']:visible").first
                 if await pin_input.count() > 0:
-                    logger.info(f"[{index}] PIN input visible immediately")
                     break
 
                 pwd_direct = page.locator("input[type='password']:visible, input[name='challengePassword']:visible").first
                 if await pwd_direct.count() > 0:
-                    logger.info(f"[{index}] Password input directly visible")
                     await pwd_direct.fill(password)
                     for s in ["button:has-text('Submit')", "button[type='submit']"]:
                         btn = page.locator(s).first
                         if await btn.count() > 0:
                             await btn.click(force=True)
                             break
-                    await page.wait_for_timeout(3000)
+                    for _ in range(20):
+                        await page.wait_for_timeout(300)
+                        if "pinentry" in page.url.lower() or await page.locator("input[name='PIN']:visible").count() > 0:
+                            break
                     break
 
                 confirm_found = False
-                for ci in range(5):
+                for ci in range(6):
                     confirm = page.locator("button:has-text('Confirm password')").first
                     if await confirm.count() > 0:
                         confirm_found = True
                         break
-                    await page.wait_for_timeout(500)
+                    await page.wait_for_timeout(400)
 
                 if confirm_found:
                     await confirm.click(force=True)
                     logger.info(f"[{index}] Clicked 'Confirm password' (force)")
                     await page.wait_for_timeout(2000)
 
+                    error_msg = await page.locator("text=something went wrong").count() + \
+                                await page.locator("text=trouble with your request").count()
+                    if error_msg > 0:
+                        logger.warning(f"[{index}] Netflix error after confirm click, waiting before retry (attempt {attempt+1}/3)")
+                        await page.wait_for_timeout(3000 * (attempt + 1))
+                        continue
+
                     pwd_found = False
-                    for pi in range(15):
+                    for pi in range(16):
                         pwd = page.locator("input[type='password']:visible, input[name='challengePassword']:visible").first
                         if await pwd.count() > 0:
                             await pwd.fill(password)
@@ -810,23 +810,31 @@ class NetflixBrowser:
                                     await btn.click(force=True)
                                     logger.info(f"[{index}] Clicked submit: {s}")
                                     break
-                            await page.wait_for_timeout(3000)
+
+                            for _ in range(20):
+                                await page.wait_for_timeout(300)
+                                if "pinentry" in page.url.lower() or await page.locator("input[name='PIN']:visible").count() > 0:
+                                    break
+                                wrong_pwd = await page.locator("text=Incorrect password").count() + \
+                                            await page.locator("text=Wrong password").count()
+                                if wrong_pwd > 0:
+                                    return {"index": index, "success": False, "error": "Incorrect password"}
                             pwd_found = True
                             break
                         await page.wait_for_timeout(500)
 
                     if not pwd_found:
-                        logger.warning(f"[{index}] Password input not found after confirm click, retrying entire flow (attempt {attempt+1})")
-                        await page.wait_for_timeout(2000)
+                        logger.warning(f"[{index}] MFA dialog failed, retrying (attempt {attempt+1}/3)")
+                        await page.wait_for_timeout(2000 * (attempt + 1))
                         continue
                     break
                 else:
-                    logger.warning(f"[{index}] No Confirm password button found, retrying (attempt {attempt+1})")
+                    logger.warning(f"[{index}] No Confirm password button, retrying (attempt {attempt+1}/3)")
                     await page.wait_for_timeout(2000)
                     continue
 
             pin_filled = False
-            for wait_pin in range(20):
+            for _ in range(20):
                 main_pin = page.locator("input[name='PIN']:visible").first
                 if await main_pin.count() > 0:
                     await main_pin.click()
@@ -834,12 +842,7 @@ class NetflixBrowser:
                     logger.info(f"[{index}] Filled PIN: {pin}")
                     pin_filled = True
                     break
-
-                if "pinentry" in page.url.lower():
-                    await page.wait_for_timeout(500)
-                    continue
-
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(300)
 
             if not pin_filled:
                 return {"index": index, "success": False, "error": "PIN input not found"}
@@ -851,7 +854,7 @@ class NetflixBrowser:
                     logger.info(f"[{index}] Clicked {sel}")
                     break
 
-            for w in range(20):
+            for _ in range(16):
                 await page.wait_for_timeout(300)
                 if "profilePinUpdated=success" in page.url or "profilePinAdded=success" in page.url:
                     break
@@ -888,26 +891,26 @@ class NetflixBrowser:
         if not items:
             return [{"index": i, "success": False, "error": "No GUID"} for i in range(len(profiles))]
 
-        max_concurrent = 2
-        logger.info(f"Setting PINs: {len(items)} profiles, max {max_concurrent} concurrent, each with own browser")
+        logger.info(f"Setting PINs: {len(items)} profiles sequentially (MFA requires single-threaded)")
 
         results = [None] * len(profiles)
-        sem = asyncio.Semaphore(max_concurrent)
 
-        async def _worker(idx, guid, pin, delay):
-            if delay > 0:
-                await asyncio.sleep(delay)
-            async with sem:
-                return await self._set_pin_individual(idx, guid, pin, password)
-
-        tasks = [_worker(idx, guid, pin, j * 2.0) for j, (idx, guid, pin) in enumerate(items)]
-        task_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for r in task_results:
-            if isinstance(r, Exception):
-                continue
+        for j, (idx, guid, pin) in enumerate(items):
+            if j > 0:
+                await asyncio.sleep(1.5)
+            r = await self._set_pin_individual(idx, guid, pin, password)
             if isinstance(r, dict) and "index" in r:
                 results[r["index"]] = r
+
+        failed = [(idx, guid, pin) for idx, guid, pin in items if results[idx] and not results[idx].get("success")]
+        if failed:
+            logger.info(f"Retrying {len(failed)} failed PINs...")
+            await asyncio.sleep(3)
+            for idx, guid, pin in failed:
+                r = await self._set_pin_individual(idx, guid, pin, password)
+                if isinstance(r, dict) and r.get("success"):
+                    results[r["index"]] = r
+                await asyncio.sleep(2)
 
         for i in range(len(profiles)):
             if results[i] is None:
@@ -1538,7 +1541,7 @@ async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        await safe_edit(msg, f"Setting {len(regular_profiles)} PINs in PARALLEL...")
+        await safe_edit(msg, f"Setting PINs for {len(regular_profiles)} profiles...")
 
         results = await netflix.set_all_pins_parallel(regular_profiles, pins, password)
 
