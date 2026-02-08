@@ -637,13 +637,14 @@ class NetflixBrowser:
 
     async def _set_pin_on_page(self, page: Page, guid: str, pin: str, password: str, index: int) -> dict:
         try:
+            timeout = 80.0 + (index * 2)
             return await asyncio.wait_for(
                 self._do_set_pin(page, guid, pin, password, index),
-                timeout=60.0
+                timeout=timeout
             )
         except asyncio.TimeoutError:
             logger.error(f"[{index}] PIN set timed out for {guid}")
-            return {"index": index, "success": False, "error": "Timed out after 60s"}
+            return {"index": index, "success": False, "error": "Timed out"}
         except Exception as e:
             logger.error(f"[{index}] Set PIN error: {e}")
             return {"index": index, "success": False, "error": str(e)}
@@ -652,12 +653,20 @@ class NetflixBrowser:
         try:
             logger.info(f"[{index}] Setting PIN for profile: {guid}")
 
+            stagger = index * 2
+            if stagger > 0:
+                logger.info(f"[{index}] Stagger delay: {stagger}s")
+                await page.wait_for_timeout(stagger * 1000)
+
             lock_url = f"https://www.netflix.com/settings/lock/{guid}"
             logger.info(f"[{index}] Step 1: Navigate to lock page")
             try:
-                await page.goto(lock_url, wait_until="networkidle", timeout=25000)
+                await page.goto(lock_url, wait_until="networkidle", timeout=30000)
             except Exception:
-                await page.goto(lock_url, wait_until="domcontentloaded", timeout=15000)
+                try:
+                    await page.goto(lock_url, wait_until="domcontentloaded", timeout=20000)
+                except Exception as nav_err:
+                    return {"index": index, "success": False, "error": f"Navigation failed: {short_error(nav_err)}"}
             await page.wait_for_timeout(3000)
 
             if "login" in page.url.lower():
@@ -675,88 +684,64 @@ class NetflixBrowser:
             ]
 
             btn_clicked = False
-            for selector in pin_btn_selectors:
-                el = page.locator(selector).first
-                if await el.count() > 0 and await el.is_visible():
-                    await el.click()
-                    btn_clicked = True
-                    logger.info(f"[{index}] Step 2: Clicked PIN button: {selector}")
-                    break
-
-            if not btn_clicked:
-                all_btns = await page.locator("button:visible, a:visible").all()
-                logger.info(f"[{index}] No PIN button found. Visible buttons: {len(all_btns)}")
-                for i, btn in enumerate(all_btns[:15]):
-                    text = ""
-                    try:
-                        text = (await btn.inner_text()).strip()
-                    except:
-                        pass
-                    logger.info(f"[{index}] btn[{i}]: '{text[:80]}'")
-                    if "pin" in text.lower() or "lock" in text.lower() or "create" in text.lower() or "edit" in text.lower():
-                        await btn.click()
+            for retry in range(5):
+                for selector in pin_btn_selectors:
+                    el = page.locator(selector).first
+                    if await el.count() > 0 and await el.is_visible():
+                        await el.click()
                         btn_clicked = True
-                        logger.info(f"[{index}] Step 2: Clicked fallback button at index {i}: '{text}'")
+                        logger.info(f"[{index}] Step 2: Clicked PIN button: {selector}")
                         break
+                if btn_clicked:
+                    break
+                await page.wait_for_timeout(2000)
 
             if not btn_clicked:
                 return {"index": index, "success": False, "error": "No Edit PIN / Create Lock button found"}
 
-            await page.wait_for_timeout(3000)
-
-            confirm_pwd_selectors = [
-                "button:has-text('Confirm password')",
-                "a:has-text('Confirm password')",
-                "[role='button']:has-text('Confirm password')",
-                "button:has-text('Confirm Password')",
-                "div:has-text('Confirm password'):visible",
-            ]
+            await page.wait_for_timeout(2000)
 
             confirm_clicked = False
-            for selector in confirm_pwd_selectors:
-                el = page.locator(selector).first
-                if await el.count() > 0 and await el.is_visible():
-                    await el.click()
+            for retry in range(8):
+                pwd_check = page.locator("input[type='password']:visible").first
+                if await pwd_check.count() > 0:
+                    logger.info(f"[{index}] Step 3: Password input already visible")
                     confirm_clicked = True
-                    logger.info(f"[{index}] Step 3: Clicked 'Confirm password': {selector}")
                     break
 
-            if not confirm_clicked:
-                all_modal_els = await page.locator("[role='dialog'] button:visible, [role='dialog'] a:visible, [role='dialog'] [role='button']:visible, [class*='modal'] button:visible, [class*='modal'] a:visible").all()
-                if not all_modal_els:
-                    all_modal_els = await page.locator("button:visible, a:visible, [role='button']:visible").all()
-                logger.info(f"[{index}] Looking for confirm password among {len(all_modal_els)} elements")
-                for i, el in enumerate(all_modal_els):
+                for selector in ["button:has-text('Confirm password')", "a:has-text('Confirm password')", "[role='button']:has-text('Confirm password')"]:
+                    el = page.locator(selector).first
+                    if await el.count() > 0 and await el.is_visible():
+                        await el.click()
+                        confirm_clicked = True
+                        logger.info(f"[{index}] Step 3: Clicked '{selector}'")
+                        break
+                if confirm_clicked:
+                    break
+
+                all_els = await page.locator("button:visible, a:visible, [role='button']:visible").all()
+                for el in all_els:
                     text = ""
                     try:
-                        text = (await el.inner_text()).strip()
+                        text = (await el.inner_text()).strip().lower()
                     except:
                         pass
-                    logger.info(f"[{index}] modal_el[{i}]: '{text[:80]}'")
-                    if "confirm" in text.lower() and "password" in text.lower():
+                    if "confirm" in text and "password" in text:
                         await el.click()
                         confirm_clicked = True
-                        logger.info(f"[{index}] Step 3: Clicked confirm password element at index {i}")
+                        logger.info(f"[{index}] Step 3: Clicked confirm password fallback")
                         break
-                    if "password" in text.lower() and ("use" in text.lower() or "enter" in text.lower()):
-                        await el.click()
-                        confirm_clicked = True
-                        logger.info(f"[{index}] Step 3: Clicked password option at index {i}")
-                        break
-
-            if not confirm_clicked:
-                pwd_input = page.locator("input[type='password']:visible").first
-                if await pwd_input.count() > 0:
-                    logger.info(f"[{index}] Step 3: Password input already visible, skipping confirm click")
-                    confirm_clicked = True
+                if confirm_clicked:
+                    break
+                await page.wait_for_timeout(2000)
 
             if not confirm_clicked:
                 return {"index": index, "success": False, "error": "Could not find 'Confirm password' option"}
 
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(2000)
 
             pwd_input = None
-            for attempt in range(8):
+            for attempt in range(12):
                 pwd_input = page.locator("input[type='password']:visible").first
                 if await pwd_input.count() > 0:
                     break
@@ -792,18 +777,17 @@ class NetflixBrowser:
                 await page.keyboard.press("Enter")
                 logger.info(f"[{index}] Step 5: Pressed Enter to submit password")
 
-            await page.wait_for_timeout(4000)
+            await page.wait_for_timeout(5000)
 
             wrong_pwd = await page.locator("text=Incorrect password").count() + \
-                        await page.locator("text=Wrong password").count() + \
-                        await page.locator("text=incorrect").count()
+                        await page.locator("text=Wrong password").count()
             if wrong_pwd > 0:
                 return {"index": index, "success": False, "error": "Incorrect password"}
 
             logger.info(f"[{index}] Step 6: Looking for PIN inputs on page: {page.url}")
 
             pin_filled = False
-            for attempt in range(10):
+            for attempt in range(15):
                 main_pin = page.locator("input[name='PIN']:visible").first
                 if await main_pin.count() > 0:
                     logger.info(f"[{index}] Found main PIN input (name=PIN), filling with {pin}")
@@ -819,18 +803,6 @@ class NetflixBrowser:
                     await pin_input_numeric.click()
                     await pin_input_numeric.press("Control+a")
                     await pin_input_numeric.fill(pin)
-                    pin_filled = True
-                    break
-
-                text_inputs = await page.locator("input[type='text']:visible").all()
-                non_search = [inp for inp in text_inputs]
-                if len(non_search) >= 4:
-                    logger.info(f"[{index}] Found {len(non_search)} text inputs, trying as digit inputs")
-                    for i in range(min(4, len(pin))):
-                        digit = pin[i]
-                        await non_search[i].click()
-                        await non_search[i].fill(digit)
-                        await page.wait_for_timeout(50)
                     pin_filled = True
                     break
 
