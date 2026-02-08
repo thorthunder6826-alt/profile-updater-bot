@@ -779,34 +779,55 @@ class NetflixBrowser:
             if not btn_clicked:
                 return {"index": index, "success": False, "error": "No Edit PIN / Create Lock button found"}
 
-            for wait in range(20):
+            mfa_handled = False
+            for wait in range(30):
                 pin_input = page.locator("input[name='PIN']:visible").first
                 if await pin_input.count() > 0:
                     logger.info(f"[{index}] PIN input visible (no MFA)")
+                    mfa_handled = True
                     break
 
-                confirm = page.locator("button:has-text('Confirm password')").first
-                if await confirm.count() > 0:
-                    await confirm.click()
-                    logger.info(f"[{index}] Clicked 'Confirm password'")
+                if "pinentry" in page.url.lower():
+                    logger.info(f"[{index}] On PIN entry page")
+                    mfa_handled = True
+                    break
 
-                    for t in range(15):
-                        await page.wait_for_timeout(300)
+                confirm_selectors = [
+                    "button:has-text('Confirm password')",
+                    "*:has-text('Confirm password') >> button",
+                    "text=Confirm password",
+                ]
+                confirm_clicked = False
+                for cs in confirm_selectors:
+                    try:
+                        confirm = page.locator(cs).first
+                        if await confirm.count() > 0 and await confirm.is_visible():
+                            await confirm.click()
+                            logger.info(f"[{index}] Clicked 'Confirm password': {cs}")
+                            confirm_clicked = True
+                            break
+                    except:
+                        pass
 
-                        pwd_input = page.locator("input[type='password']:visible").first
+                if confirm_clicked:
+                    for t in range(20):
+                        await page.wait_for_timeout(400)
+
+                        pwd_input = page.locator("input[type='password']:visible, input[name='challengePassword']:visible").first
                         if await pwd_input.count() > 0:
                             await pwd_input.fill(password)
                             logger.info(f"[{index}] Entered password")
 
-                            for s in ["button:has-text('Submit')", "button[type='submit']", "button:has-text('Continue')"]:
+                            for s in ["button:has-text('Submit')", "button[type='submit']", "button:has-text('Continue')", "button:has-text('Sign In')"]:
                                 btn = page.locator(s).first
                                 if await btn.count() > 0 and await btn.is_visible():
                                     await btn.click()
+                                    logger.info(f"[{index}] Clicked submit: {s}")
                                     break
 
-                            for w in range(20):
-                                await page.wait_for_timeout(250)
-                                if "pinEntry" in page.url or "pinentry" in page.url.lower():
+                            for w in range(30):
+                                await page.wait_for_timeout(300)
+                                if "pinentry" in page.url.lower():
                                     break
                                 wrong_pwd = await page.locator("text=Incorrect password").count() + \
                                             await page.locator("text=Wrong password").count()
@@ -815,14 +836,16 @@ class NetflixBrowser:
                                 pin_c = page.locator("input[name='PIN']:visible").first
                                 if await pin_c.count() > 0:
                                     break
+                            mfa_handled = True
                             break
 
                         pin_check = page.locator("input[name='PIN']:visible").first
                         if await pin_check.count() > 0:
+                            mfa_handled = True
                             break
                     break
 
-                await page.wait_for_timeout(300)
+                await page.wait_for_timeout(500)
 
             pin_filled = False
             for attempt in range(15):
