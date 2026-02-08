@@ -1539,23 +1539,29 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = (
-        "*Netflix Profile Manager Bot*\n\n"
-        "*Session Commands:*\n"
-        "`/login <cookie>` - Login with Netflix cookie\n"
-        "`/loginemail <email> <password>` - Login with email/password\n"
-        "`/profiles` - List all profiles\n"
-        "`/logout` - Clear session\n\n"
-        "*Profile Management:*\n"
-        "`/updateallprofiles <n1> <n2> ... <password>` - Update ALL names\n"
-        "`/updateallpins <p1> <p2> ... <password>` - Set ALL PINs\n"
-        "`/addprofile <name>` - Add new profile\n"
-        "`/deleteprofile <guid>` - Delete profile\n"
-        "`/updateprofile <guid> <name>` - Update single profile\n"
-        "`/setpin <guid> <pin> <password>` - Set single PIN\n\n"
-        "*Admin:*\n"
-        "`/adduser <id>` | `/removeuser <id>` | `/listusers`\n\n"
-        "Use `/help` for examples."
+        "\U0001F3AC *Netflix Profile Manager*\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+        "\U0001F511 *Session*\n"
+        "\u2022 `/login <cookie>` \u2014 Login with Netflix cookie\n"
+        "\u2022 `/loginemail <email> <password>` \u2014 Login with credentials\n"
+        "\u2022 `/profiles` \u2014 View all profiles\n"
+        "\u2022 `/logout` \u2014 Clear session\n\n"
+        "\u2699\uFE0F *Profile Management*\n"
+        "\u2022 `/updateallprofiles <n1> <n2> ... <password>`\n"
+        "   \u2514 Update all profile names at once\n"
+        "\u2022 `/updateallpins <p1> <p2> ... <password>`\n"
+        "   \u2514 Set all profile PINs at once\n\n"
     )
+
+    if user_id == HOST_USER_ID:
+        msg += (
+            "\U0001F6E1 *Admin*\n"
+            "\u2022 `/adduser <id>` \u2014 Authorize a user\n"
+            "\u2022 `/removeuser <id>` \u2014 Remove a user\n"
+            "\u2022 `/listusers` \u2014 List all authorized users\n\n"
+        )
+
+    msg += "\U0001F4AC Type `/help` for usage examples."
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 
@@ -1566,19 +1572,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = (
-        "*Help & Examples*\n\n"
-        "*Bulk Update Examples:*\n"
-        "`/updateallprofiles MOON SUN LIGHT DARK FUSION MyPassword`\n"
+        "\U0001F4D6 *Help & Examples*\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+        "\u270F\uFE0F *Rename All Profiles*\n"
+        "`/updateallprofiles MOON SUN LIGHT DARK FUSION MyPassword`\n\n"
+        "\U0001F510 *Set All PINs*\n"
         "`/updateallpins 1111 2222 3333 4444 5555 MyPassword`\n\n"
-        "Both commands run in PARALLEL (multiple browser tabs)!\n"
-        "The LAST argument is always your Netflix account password.\n\n"
-        "*Single Profile:*\n"
-        "`/updateprofile <guid> NewName`\n"
-        "`/setpin <guid> 1234 MyPassword`\n\n"
-        "*Login:*\n"
-        "Get cookie from browser DevTools > Application > Cookies\n"
-        "Copy NetflixId and SecureNetflixId values\n\n"
-        "*Note:* Profile updates use browser automation and may take 10-30 seconds."
+        "\u2139\uFE0F *How it works:*\n"
+        "\u2022 The *last* argument is always your Netflix password\n"
+        "\u2022 Names/PINs are assigned in profile order\n"
+        "\u2022 Profile renames run in parallel for speed\n"
+        "\u2022 PINs are set one by one (Netflix requirement)\n\n"
+        "\U0001F511 *Login:*\n"
+        "\u2022 Get cookies from browser DevTools \u2192 Application \u2192 Cookies\n"
+        "\u2022 Copy `NetflixId` and `SecureNetflixId` values\n\n"
+        "\u23F1 *Timing:* Renames ~10\u201315s \u2022 PINs ~35s (for 5 profiles)"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
