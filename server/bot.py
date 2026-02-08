@@ -309,33 +309,54 @@ class NetflixBrowser:
                 await page.keyboard.press("Enter")
                 logger.info("Pressed Enter to submit")
 
-            success_pages = ["browse", "profile", "manageprofile", "YourAccount"]
+            success_keywords = ["browse", "profile", "manageprofile", "youraccount", "selectprofile", "switchprofile"]
+            fail_keywords = ["incorrect", "wrong", "invalid", "try again", "not right", "doesn't match", "error"]
             logged_in = False
-            for _ in range(30):
-                await page.wait_for_timeout(300)
+            for attempt in range(60):
+                await page.wait_for_timeout(500)
                 url = page.url.lower()
 
-                if any(sp.lower() in url for sp in success_pages):
+                if attempt % 10 == 0:
+                    logger.info(f"Waiting for login... attempt {attempt}, URL: {page.url}")
+
+                if any(kw in url for kw in success_keywords):
+                    logged_in = True
+                    break
+
+                if "login" not in url and "signup" not in url:
                     logged_in = True
                     break
 
                 error_el = page.locator("[data-uia='error-message-container'], .ui-message-contents").first
-                if await error_el.count() > 0:
-                    err_text = (await error_el.text_content() or "").strip()
-                    if err_text and any(w in err_text.lower() for w in ["incorrect", "wrong", "invalid", "try again", "not right"]):
-                        await cleanup()
-                        return False, f"Login failed: {err_text}", ""
+                try:
+                    if await error_el.count() > 0:
+                        err_text = (await error_el.text_content() or "").strip()
+                        if err_text and any(w in err_text.lower() for w in fail_keywords):
+                            await cleanup()
+                            return False, f"Login failed: {err_text}", ""
+                except:
+                    pass
+
+            final_url = page.url.lower()
+            logger.info(f"Login wait finished. URL: {page.url}, logged_in={logged_in}")
 
             if not logged_in:
-                url = page.url.lower()
-                if "login" in url:
+                if any(kw in final_url for kw in success_keywords):
+                    logged_in = True
+                elif "login" in final_url or "signup" in final_url:
+                    error_el = page.locator("[data-uia='error-message-container'], .ui-message-contents").first
+                    try:
+                        if await error_el.count() > 0:
+                            err_text = (await error_el.text_content() or "").strip()
+                            if err_text:
+                                await cleanup()
+                                return False, f"Login failed: {err_text}", ""
+                    except:
+                        pass
                     await cleanup()
                     return False, "Login failed — check your email and password", ""
-                elif any(sp.lower() in url for sp in success_pages):
-                    logged_in = True
                 else:
-                    await cleanup()
-                    return False, f"Login ended on unexpected page: {page.url}", ""
+                    logged_in = True
 
             logger.info(f"Login successful, extracting cookies from: {page.url}")
             cookies = await context.cookies()
@@ -1711,13 +1732,22 @@ async def loginemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await safe_reply(update.message, "Not authorized.")
         return
 
-    if len(context.args) < 2:
+    raw_text = update.message.text or ""
+    parts = raw_text.split(None, 2)
+    if len(parts) < 3:
         await safe_reply(update.message, "Usage: /loginemail <email> <password>")
         return
 
-    email = context.args[0]
-    password = ' '.join(context.args[1:])
+    email_and_pass = parts[1] + " " + parts[2] if len(parts) > 2 else ""
+    space_idx = email_and_pass.find(" ")
+    if space_idx < 0:
+        await safe_reply(update.message, "Usage: /loginemail <email> <password>")
+        return
 
+    email = email_and_pass[:space_idx].strip()
+    password = email_and_pass[space_idx+1:].strip()
+
+    logger.info(f"Login attempt: email={email}, password={'*' * (len(password)-2) + password[-2:] if len(password) > 2 else '***'}")
     msg = await update.message.reply_text("Logging in with email/password...\nThis may take a moment...")
 
     try:
