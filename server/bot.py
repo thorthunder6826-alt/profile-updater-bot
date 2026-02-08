@@ -21,6 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 netflix_sessions: Dict[int, dict] = {}
+pending_email_codes: Dict[int, asyncio.Future] = {}
 
 MAX_TG_MSG = 4000
 
@@ -707,9 +708,145 @@ class NetflixBrowser:
 
         return results
 
-    async def _do_set_pin(self, page: Page, guid: str, pin: str, password: str, index: int) -> dict:
+    async def _try_email_code_mfa(self, page: Page, index: int, code_callback=None) -> bool:
+        if not code_callback:
+            return False
+
+        await page.goto(page.url.split("?")[0] if "?" in page.url else page.url, wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(2000)
+
+        pin_btn_selectors = [
+            "button:has-text('Edit PIN')",
+            "button:has-text('Create a Profile Lock')",
+        ]
+        for selector in pin_btn_selectors:
+            el = page.locator(selector).first
+            if await el.count() > 0 and await el.is_visible():
+                await el.click()
+                logger.info(f"[{index}] Email MFA: Clicked {selector}")
+                break
+        await page.wait_for_timeout(2000)
+
+        email_btn_selectors = [
+            "button:has-text('Email a code')",
+            "a:has-text('Email a code')",
+            "button:has-text('Email')",
+        ]
+        email_clicked = False
+        for ci in range(6):
+            for selector in email_btn_selectors:
+                el = page.locator(selector).first
+                if await el.count() > 0:
+                    await el.click(force=True)
+                    email_clicked = True
+                    logger.info(f"[{index}] Clicked '{selector}' for email code MFA")
+                    break
+            if email_clicked:
+                break
+            await page.wait_for_timeout(500)
+
+        if not email_clicked:
+            logger.warning(f"[{index}] No 'Email a code' button found")
+            return False
+
+        await page.wait_for_timeout(2000)
+
+        error_check = await page.locator("text=something went wrong").count()
+        if error_check > 0:
+            logger.warning(f"[{index}] Email code also got 'something went wrong'")
+            return False
+
+        email_hint = ""
+        try:
+            body_text = await page.locator("body").inner_text()
+            import re as re_mod
+            email_match = re_mod.search(r'[\w.*]+@[\w.]+\.\w+', body_text)
+            if email_match:
+                email_hint = email_match.group(0)
+        except:
+            pass
+
+        logger.info(f"[{index}] Requesting email verification code from user (email: {email_hint})")
+        code = await code_callback(index, email_hint)
+
+        if not code:
+            logger.warning(f"[{index}] No email code received from user")
+            return False
+
+        code = code.strip()
+        logger.info(f"[{index}] Got email code: {code}")
+
+        code_input_selectors = [
+            "input[name='code']:visible",
+            "input[name='pin']:visible",
+            "input[type='tel']:visible",
+            "input[inputmode='numeric']:visible",
+            "input[placeholder*='code']:visible",
+            "input[placeholder*='Code']:visible",
+        ]
+
+        code_entered = False
+        for ci in range(12):
+            for selector in code_input_selectors:
+                el = page.locator(selector).first
+                if await el.count() > 0:
+                    await el.click()
+                    await el.fill(code)
+                    code_entered = True
+                    logger.info(f"[{index}] Entered email code in: {selector}")
+                    break
+            if code_entered:
+                break
+            await page.wait_for_timeout(500)
+
+        if not code_entered:
+            all_inputs = await page.locator("input:visible").count()
+            for i in range(all_inputs):
+                inp = page.locator("input:visible").nth(i)
+                itype = await inp.get_attribute("type") or ""
+                iname = await inp.get_attribute("name") or ""
+                if itype in ("text", "tel", "number", "") and iname not in ("vendor-search-handler",):
+                    await inp.click()
+                    await inp.fill(code)
+                    code_entered = True
+                    logger.info(f"[{index}] Entered code in generic input (type={itype}, name={iname})")
+                    break
+
+        if not code_entered:
+            logger.warning(f"[{index}] Could not find code input field")
+            return False
+
+        submit_selectors = [
+            "button:has-text('Submit')",
+            "button:has-text('Continue')",
+            "button:has-text('Verify')",
+            "button:has-text('Next')",
+            "button[type='submit']",
+        ]
+        for selector in submit_selectors:
+            btn = page.locator(selector).first
+            if await btn.count() > 0:
+                await btn.click(force=True)
+                logger.info(f"[{index}] Clicked submit: {selector}")
+                break
+
+        for _ in range(30):
+            await page.wait_for_timeout(500)
+            if "pinentry" in page.url.lower() or await page.locator("input[name='PIN']:visible").count() > 0:
+                logger.info(f"[{index}] Email code MFA succeeded!")
+                return True
+            err = await page.locator("text=invalid").count() + await page.locator("text=incorrect").count() + await page.locator("text=expired").count()
+            if err > 0:
+                logger.warning(f"[{index}] Email code was invalid/expired")
+                return False
+
+        logger.warning(f"[{index}] Email code MFA: timed out waiting for PIN entry")
+        return False
+
+    async def _do_set_pin(self, page: Page, guid: str, pin: str, password: str, index: int, code_callback=None) -> dict:
         try:
             logger.info(f"[{index}] Setting PIN for profile: {guid}")
+            password_failed = False
 
             for attempt in range(3):
                 lock_url = f"https://www.netflix.com/settings/lock/{guid}"
@@ -777,6 +914,13 @@ class NetflixBrowser:
                             break
                     break
 
+                if password_failed and code_callback:
+                    logger.info(f"[{index}] Password MFA failed before, trying email code directly")
+                    email_ok = await self._try_email_code_mfa(page, index, code_callback)
+                    if email_ok:
+                        break
+                    return {"index": index, "success": False, "error": "Email code MFA also failed"}
+
                 confirm_found = False
                 for ci in range(6):
                     confirm = page.locator("button:has-text('Confirm password')").first
@@ -793,9 +937,17 @@ class NetflixBrowser:
                     error_msg = await page.locator("text=something went wrong").count() + \
                                 await page.locator("text=trouble with your request").count()
                     if error_msg > 0:
-                        logger.warning(f"[{index}] Netflix error after confirm click, waiting before retry (attempt {attempt+1}/3)")
-                        await page.wait_for_timeout(3000 * (attempt + 1))
-                        continue
+                        logger.warning(f"[{index}] Password MFA got 'something went wrong'")
+                        password_failed = True
+                        if code_callback:
+                            logger.info(f"[{index}] Falling back to email code MFA")
+                            email_ok = await self._try_email_code_mfa(page, index, code_callback)
+                            if email_ok:
+                                break
+                            return {"index": index, "success": False, "error": "Email code MFA failed"}
+                        else:
+                            await page.wait_for_timeout(3000 * (attempt + 1))
+                            continue
 
                     pwd_found = False
                     for pi in range(16):
@@ -824,7 +976,14 @@ class NetflixBrowser:
                         await page.wait_for_timeout(500)
 
                     if not pwd_found:
-                        logger.warning(f"[{index}] MFA dialog failed, retrying (attempt {attempt+1}/3)")
+                        logger.warning(f"[{index}] MFA dialog failed (attempt {attempt+1}/3)")
+                        password_failed = True
+                        if code_callback and attempt >= 1:
+                            logger.info(f"[{index}] Falling back to email code MFA after password failures")
+                            email_ok = await self._try_email_code_mfa(page, index, code_callback)
+                            if email_ok:
+                                break
+                            return {"index": index, "success": False, "error": "Email code MFA failed"}
                         await page.wait_for_timeout(2000 * (attempt + 1))
                         continue
                     break
@@ -867,13 +1026,13 @@ class NetflixBrowser:
             logger.error(f"[{index}] Set PIN error: {e}")
             return {"index": index, "success": False, "error": str(e)}
 
-    async def _set_pin_individual(self, index: int, guid: str, pin: str, password: str) -> dict:
+    async def _set_pin_individual(self, index: int, guid: str, pin: str, password: str, code_callback=None) -> dict:
         p = None
         browser = None
         try:
             p, browser, context = await self._launch_browser()
             page = await context.new_page()
-            result = await self._do_set_pin(page, guid, pin, password, index)
+            result = await self._do_set_pin(page, guid, pin, password, index, code_callback=code_callback)
             await self._safe_close(p, browser)
             return result
         except Exception as e:
@@ -881,7 +1040,7 @@ class NetflixBrowser:
             await self._safe_close(p, browser)
             return {"index": index, "success": False, "error": str(e)}
 
-    async def set_all_pins_parallel(self, profiles: List[dict], pins: List[str], password: str) -> List[dict]:
+    async def set_all_pins_parallel(self, profiles: List[dict], pins: List[str], password: str, code_callback=None) -> List[dict]:
         items = []
         for i, (profile, pin) in enumerate(zip(profiles, pins)):
             guid = profile.get("guid", "")
@@ -898,7 +1057,7 @@ class NetflixBrowser:
         for j, (idx, guid, pin) in enumerate(items):
             if j > 0:
                 await asyncio.sleep(1.5)
-            r = await self._set_pin_individual(idx, guid, pin, password)
+            r = await self._set_pin_individual(idx, guid, pin, password, code_callback=code_callback)
             if isinstance(r, dict) and "index" in r:
                 results[r["index"]] = r
 
@@ -907,7 +1066,7 @@ class NetflixBrowser:
             logger.info(f"Retrying {len(failed)} failed PINs...")
             await asyncio.sleep(3)
             for idx, guid, pin in failed:
-                r = await self._set_pin_individual(idx, guid, pin, password)
+                r = await self._set_pin_individual(idx, guid, pin, password, code_callback=code_callback)
                 if isinstance(r, dict) and r.get("success"):
                     results[r["index"]] = r
                 await asyncio.sleep(2)
@@ -1159,13 +1318,13 @@ class NetflixBrowser:
             await self._safe_close(p, browser)
             return False, f"Error: {str(e)}"
 
-    async def set_profile_pin(self, guid: str, pin: str, password: str = "") -> tuple:
+    async def set_profile_pin(self, guid: str, pin: str, password: str = "", code_callback=None) -> tuple:
         p = None
         browser = None
         try:
             p, browser, context = await self._launch_browser()
             page = await context.new_page()
-            result = await self._do_set_pin(page, guid, pin, password, 0)
+            result = await self._do_set_pin(page, guid, pin, password, 0, code_callback=code_callback)
             await self._safe_close(p, browser)
             if result.get("success"):
                 return True, "Profile PIN set!"
@@ -1543,7 +1702,9 @@ async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TY
 
         await safe_edit(msg, f"Setting PINs for {len(regular_profiles)} profiles...")
 
-        results = await netflix.set_all_pins_parallel(regular_profiles, pins, password)
+        chat_id = update.effective_chat.id
+        code_callback = make_email_code_callback(chat_id, context.bot)
+        results = await netflix.set_all_pins_parallel(regular_profiles, pins, password, code_callback=code_callback)
 
         lines = []
         for i, (profile, result) in enumerate(zip(regular_profiles, results)):
@@ -1673,8 +1834,10 @@ async def setpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("Setting PIN...")
 
+    chat_id = update.effective_chat.id
+    code_callback = make_email_code_callback(chat_id, context.bot)
     netflix = netflix_sessions[user_id]["browser"]
-    success, result = await netflix.set_profile_pin(guid, pin, password)
+    success, result = await netflix.set_profile_pin(guid, pin, password, code_callback=code_callback)
     await safe_edit(msg, f"{'OK' if success else 'FAIL'}: {result}")
 
 
@@ -1772,6 +1935,45 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update.message, f"Error: {short_error(e)}")
 
 
+def make_email_code_callback(chat_id: int, bot):
+    async def code_callback(profile_index: int, email_hint: str):
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        pending_email_codes[chat_id] = future
+
+        hint_text = f" (sent to {email_hint})" if email_hint else ""
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"Netflix needs email verification for profile #{profile_index + 1}{hint_text}.\n\n"
+                 f"Please reply with the verification code from your email:"
+        )
+
+        try:
+            code = await asyncio.wait_for(future, timeout=300)
+            return code
+        except asyncio.TimeoutError:
+            await bot.send_message(chat_id=chat_id, text="Email code timed out (5 min). PIN setting failed for this profile.")
+            return None
+        finally:
+            pending_email_codes.pop(chat_id, None)
+
+    return code_callback
+
+
+async def email_code_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+
+    if chat_id in pending_email_codes:
+        future = pending_email_codes[chat_id]
+        if not future.done():
+            future.set_result(text)
+            await safe_reply(update.message, f"Got it! Entering code: {text}")
+            return
+
+
 async def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set!")
@@ -1799,6 +2001,9 @@ async def main():
     app.add_handler(CommandHandler("adduser", adduser_command))
     app.add_handler(CommandHandler("removeuser", removeuser_command))
     app.add_handler(CommandHandler("listusers", listusers_command))
+
+    from telegram.ext import MessageHandler, filters
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, email_code_message_handler))
 
     logger.info(f"Bot starting... Host user: {HOST_USER_ID}")
 
