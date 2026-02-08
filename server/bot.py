@@ -453,21 +453,17 @@ class NetflixBrowser:
         return False
 
     async def _click_name_link(self, page: Page, old_name: str, index: int) -> bool:
-        name_link_selectors = [
-            f"a:has-text('{old_name}')" if old_name else None,
+        edit_selectors = [
             "a:has-text('Edit personal')",
             "a:has-text('personal and contact')",
             "a:has-text('Edit profile')",
         ]
-
-        for selector in name_link_selectors:
-            if not selector:
-                continue
+        for selector in edit_selectors:
             try:
                 el = page.locator(selector).first
                 if await el.count() > 0 and await el.is_visible():
                     await el.click()
-                    logger.info(f"[{index}] Clicked name link: {selector}")
+                    logger.info(f"[{index}] Clicked edit link: {selector}")
                     return True
             except:
                 pass
@@ -475,18 +471,35 @@ class NetflixBrowser:
         all_links = await page.locator("a:visible, button:visible, [role='button']:visible, [role='link']:visible").all()
         for link in all_links:
             text = ""
+            href = ""
             try:
                 text = (await link.inner_text()).strip()
+                href = (await link.get_attribute("href")) or ""
             except:
                 pass
-            if old_name and old_name.lower() in text.lower():
-                await link.click()
-                logger.info(f"[{index}] Clicked element with profile name text")
-                return True
             if "edit personal" in text.lower() or "personal and contact" in text.lower():
                 await link.click()
                 logger.info(f"[{index}] Clicked 'Edit personal' link")
                 return True
+            if old_name and text.strip() == old_name.strip() and "/settings/" in href:
+                await link.click()
+                logger.info(f"[{index}] Clicked exact name link: '{text}'")
+                return True
+
+        if old_name:
+            for link in all_links:
+                text = ""
+                href = ""
+                try:
+                    text = (await link.inner_text()).strip()
+                    href = (await link.get_attribute("href")) or ""
+                except:
+                    pass
+                if old_name.lower() in text.lower() and len(text) < len(old_name) + 20:
+                    if "/browse" not in href and "/profilesgate" not in href:
+                        await link.click()
+                        logger.info(f"[{index}] Clicked name-matching link: '{text}'")
+                        return True
 
         return False
 
@@ -501,14 +514,24 @@ class NetflixBrowser:
 
         settings_url = f"https://www.netflix.com/settings/{guid}"
 
-        for attempt in range(2):
+        on_settings = False
+        for attempt in range(4):
             try:
                 await page.goto(settings_url, wait_until="domcontentloaded", timeout=20000)
             except Exception as nav_err:
+                if attempt < 3:
+                    logger.warning(f"[{index}] Nav failed (attempt {attempt+1}), retrying...")
+                    await page.wait_for_timeout(1000)
+                    continue
                 return {"index": index, "success": False, "error": f"Navigation failed: {short_error(nav_err)}"}
 
             if "login" in page.url.lower():
                 return {"index": index, "success": False, "error": "Session expired"}
+
+            if "/browse" in page.url.lower() or "/profilesgate" in page.url.lower():
+                logger.warning(f"[{index}] Redirected to {page.url} (attempt {attempt+1}), retrying...")
+                await page.wait_for_timeout(1500 * (attempt + 1))
+                continue
 
             if "/mfa" in page.url.lower():
                 mfa_ok = await self._handle_mfa_if_needed(page, password, settings_url, index)
@@ -516,16 +539,25 @@ class NetflixBrowser:
                     return {"index": index, "success": False, "error": "MFA verification failed"}
 
             if "/settings/" in page.url and "/mfa" not in page.url:
+                on_settings = True
                 break
+
+        if not on_settings:
+            logger.warning(f"[{index}] Could not reach settings page, falling back to recreate")
+            return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
 
         logger.info(f"[{index}] On settings page: {page.url}")
 
         clicked_name = await self._click_name_link(page, old_name, index)
         if not clicked_name:
-            return {"index": index, "success": False, "error": "Could not find profile name link"}
+            return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
 
         if "/mfa" in page.url.lower():
             logger.info(f"[{index}] MFA triggered for profile edit - using delete+recreate fallback")
+            return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
+
+        if "/browse" in page.url.lower():
+            logger.warning(f"[{index}] Redirected to browse after clicking name, falling back to recreate")
             return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
 
         name_input = None
@@ -536,6 +568,8 @@ class NetflixBrowser:
             await page.wait_for_timeout(300)
 
         if name_input is None:
+            if "/settings/" not in page.url:
+                return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
             return {"index": index, "success": False, "error": f"Name input not found on {page.url}"}
 
         logger.info(f"[{index}] Editing name to '{new_name}'")
@@ -558,7 +592,11 @@ class NetflixBrowser:
                 logger.info(f"[{index}] Clicked save: {selector}")
                 break
 
-        await page.wait_for_timeout(1500)
+        for w in range(15):
+            await page.wait_for_timeout(250)
+            if "/settings" not in page.url.lower():
+                break
+
         logger.info(f"[{index}] Profile updated: {new_name}")
         return {"index": index, "success": True, "new_name": new_name}
 
@@ -631,13 +669,18 @@ class NetflixBrowser:
         error = add_result.get("error", "Failed") if isinstance(add_result, dict) else str(add_result)
         return {"index": index, "success": False, "error": f"Recreate failed: {error}"}
 
+    async def _staggered_update(self, guid: str, new_name: str, password: str, index: int, delay: float) -> dict:
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return await self._update_single_profile(guid, new_name, password, index)
+
     async def update_all_profiles_parallel(self, profiles: List[dict], new_names: List[str], password: str) -> List[dict]:
         tasks = []
         for i, (profile, new_name) in enumerate(zip(profiles, new_names)):
             guid = profile.get("guid", "")
             if not guid:
                 continue
-            tasks.append(self._update_single_profile(guid, new_name, password, i))
+            tasks.append(self._staggered_update(guid, new_name, password, i, delay=i * 0.8))
 
         if not tasks:
             return [{"index": i, "success": False, "error": "No GUID"} for i in range(len(profiles))]
@@ -689,13 +732,29 @@ class NetflixBrowser:
             logger.info(f"[{index}] Setting PIN for profile: {guid}")
 
             lock_url = f"https://www.netflix.com/settings/lock/{guid}"
-            try:
-                await page.goto(lock_url, wait_until="domcontentloaded", timeout=20000)
-            except Exception as nav_err:
-                return {"index": index, "success": False, "error": f"Navigation failed: {short_error(nav_err)}"}
+            on_lock_page = False
+            for nav_attempt in range(3):
+                try:
+                    await page.goto(lock_url, wait_until="domcontentloaded", timeout=20000)
+                except Exception as nav_err:
+                    if nav_attempt < 2:
+                        await page.wait_for_timeout(1500)
+                        continue
+                    return {"index": index, "success": False, "error": f"Navigation failed: {short_error(nav_err)}"}
 
-            if "login" in page.url.lower():
-                return {"index": index, "success": False, "error": "Session expired"}
+                if "login" in page.url.lower():
+                    return {"index": index, "success": False, "error": "Session expired"}
+
+                if "/browse" in page.url.lower() or "/profilesgate" in page.url.lower():
+                    logger.warning(f"[{index}] PIN: Redirected to {page.url}, retrying...")
+                    await page.wait_for_timeout(1500 * (nav_attempt + 1))
+                    continue
+
+                on_lock_page = True
+                break
+
+            if not on_lock_page:
+                return {"index": index, "success": False, "error": "Could not reach lock page"}
 
             pin_btn_selectors = [
                 "button:has-text('Edit PIN')",
@@ -840,9 +899,14 @@ class NetflixBrowser:
         for j, item in enumerate(items):
             batches[j % n_workers].append(item)
 
+        async def _staggered_batch(batch, delay):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            return await self._set_pins_batch(batch, password)
+
         logger.info(f"Setting PINs: {len(items)} profiles across {n_workers} parallel workers")
         batch_results = await asyncio.gather(
-            *[self._set_pins_batch(batch, password) for batch in batches],
+            *[_staggered_batch(batch, i * 1.0) for i, batch in enumerate(batches)],
             return_exceptions=True
         )
 
