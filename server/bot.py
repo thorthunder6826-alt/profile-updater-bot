@@ -22,6 +22,34 @@ logger = logging.getLogger(__name__)
 
 netflix_sessions: Dict[int, dict] = {}
 
+MAX_TG_MSG = 4000
+
+async def safe_edit(msg, text: str):
+    if len(text) > MAX_TG_MSG:
+        text = text[:MAX_TG_MSG] + "\n...(truncated)"
+    try:
+        await msg.edit_text(text)
+    except Exception as e:
+        logger.error(f"Failed to edit message: {e}")
+        try:
+            await msg.edit_text(text[:500])
+        except:
+            pass
+
+async def safe_reply(message, text: str):
+    if len(text) > MAX_TG_MSG:
+        text = text[:MAX_TG_MSG] + "\n...(truncated)"
+    try:
+        await message.reply_text(text)
+    except Exception as e:
+        logger.error(f"Failed to reply: {e}")
+
+def short_error(e: Exception) -> str:
+    s = str(e)
+    if len(s) > 200:
+        s = s[:200] + "..."
+    return s
+
 CHROME_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -1023,11 +1051,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_authorized(user_id):
-        await update.message.reply_text("Not authorized.")
+        await safe_reply(update.message, "Not authorized.")
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: `/login <cookie>`", parse_mode='Markdown')
+        await safe_reply(update.message, "Usage: `/login <cookie>`", parse_mode='Markdown')
         return
 
     cookie = ' '.join(context.args)
@@ -1039,22 +1067,22 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if valid:
             netflix_sessions[user_id] = {"browser": netflix, "cookie": cookie}
-            await msg.edit_text("Login Successful!\nUse /profiles to see profiles.")
+            await safe_edit(msg, "Login Successful!\nUse /profiles to see profiles.")
         else:
-            await msg.edit_text(f"Failed: {result}")
+            await safe_edit(msg, f"Failed: {result}")
     except Exception as e:
         logger.error(f"Login error: {e}")
-        await msg.edit_text(f"Error: {str(e)}")
+        await safe_edit(msg, f"Error: {short_error(e)}")
 
 
 async def loginemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_authorized(user_id):
-        await update.message.reply_text("Not authorized.")
+        await safe_reply(update.message, "Not authorized.")
         return
 
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /loginemail <email> <password>")
+        await safe_reply(update.message, "Usage: /loginemail <email> <password>")
         return
 
     email = context.args[0]
@@ -1068,35 +1096,35 @@ async def loginemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if success and cookie:
             netflix = NetflixBrowser(cookie)
             netflix_sessions[user_id] = {"browser": netflix, "cookie": cookie}
-            await msg.edit_text(
+            await safe_edit(msg, 
                 "Login Successful!\n"
                 f"Email: {email}\n\n"
                 "Use /profiles to see profiles."
             )
         else:
-            await msg.edit_text(f"Failed: {result}")
+            await safe_edit(msg, f"Failed: {result}")
     except Exception as e:
         logger.error(f"Login email error: {e}")
-        await msg.edit_text(f"Error: {str(e)}")
+        await safe_edit(msg, f"Error: {short_error(e)}")
 
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in netflix_sessions:
         netflix_sessions.pop(user_id)
-        await update.message.reply_text("Logged out!")
+        await safe_reply(update.message, "Logged out!")
     else:
-        await update.message.reply_text("Not logged in.")
+        await safe_reply(update.message, "Not logged in.")
 
 
 async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_authorized(user_id):
-        await update.message.reply_text("Not authorized.")
+        await safe_reply(update.message, "Not authorized.")
         return
 
     if user_id not in netflix_sessions:
-        await update.message.reply_text("Login first: /login <cookie>")
+        await safe_reply(update.message, "Login first: /login <cookie>")
         return
 
     msg = await update.message.reply_text("Fetching profiles...")
@@ -1113,28 +1141,28 @@ async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     kids_tag = " [Kids]" if p.get("isKids", False) else ""
                     text += f"{i}. {p['profileName']}{kids_tag}\n   GUID: {p['guid']}\n\n"
                 text += f"Total: {len(profiles)} profiles"
-                await msg.edit_text(text)
+                await safe_edit(msg, text)
             else:
-                await msg.edit_text("No profiles found.")
+                await safe_edit(msg, "No profiles found.")
         else:
-            await msg.edit_text(f"Failed: {data}")
+            await safe_edit(msg, f"Failed: {data}")
     except Exception as e:
         logger.error(f"Profiles error: {e}")
-        await msg.edit_text(f"Error: {str(e)}")
+        await safe_edit(msg, f"Error: {short_error(e)}")
 
 
 async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_authorized(user_id):
-        await update.message.reply_text("Not authorized.")
+        await safe_reply(update.message, "Not authorized.")
         return
 
     if user_id not in netflix_sessions:
-        await update.message.reply_text("Login first.")
+        await safe_reply(update.message, "Login first.")
         return
 
     if not context.args or len(context.args) < 2:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "Usage: /updateallprofiles name1 name2 ... password\n"
             "(Last argument is your Netflix account password)"
         )
@@ -1145,7 +1173,7 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
     new_names = args
 
     if not new_names:
-        await update.message.reply_text("Please provide profile names.")
+        await safe_reply(update.message, "Please provide profile names.")
         return
 
     msg = await update.message.reply_text("Fetching profiles...")
@@ -1155,7 +1183,7 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
         success, data = await netflix.get_profiles()
 
         if not success:
-            await msg.edit_text(f"Failed to fetch profiles: {data}")
+            await safe_edit(msg, f"Failed to fetch profiles: {data}")
             return
 
         profiles = data.get("profiles", [])
@@ -1169,7 +1197,7 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
         need_to_add = names_count > existing_count
 
         if need_to_add and profiles:
-            await msg.edit_text("Removing profile locks first...")
+            await safe_edit(msg, "Removing profile locks first...")
             lock_results = await netflix.delete_all_profile_locks(profiles, password)
             deleted_locks = sum(1 for r in lock_results if isinstance(r, dict) and r.get("success"))
             logger.info(f"Deleted {deleted_locks}/{len(profiles)} profile locks")
@@ -1178,7 +1206,7 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
         if kids_count > 0:
             info_text += f" ({kids_count} Kids)"
         info_text += f"\nNames to set: {names_count}"
-        await msg.edit_text(info_text)
+        await safe_edit(msg, info_text)
         await asyncio.sleep(1)
 
         results = []
@@ -1186,7 +1214,7 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
 
         regular_to_update = min(len(regular_profiles), names_count)
         if regular_to_update > 0:
-            await msg.edit_text(f"Updating {regular_to_update} regular profiles in parallel...")
+            await safe_edit(msg, f"Updating {regular_to_update} regular profiles in parallel...")
 
             update_profiles = regular_profiles[:regular_to_update]
             update_names = new_names[:regular_to_update]
@@ -1204,7 +1232,7 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
             name_idx = regular_to_update
 
         if kids_count > 0 and name_idx < names_count:
-            await msg.edit_text(f"Removing {kids_count} Kids profiles and creating new ones...")
+            await safe_edit(msg, f"Removing {kids_count} Kids profiles and creating new ones...")
 
             deleted_count = 0
             for kids_profile in kids_profiles:
@@ -1235,7 +1263,7 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
 
         profiles_to_add = names_count - name_idx
         if profiles_to_add > 0:
-            await msg.edit_text(f"Adding {profiles_to_add} new profiles...")
+            await safe_edit(msg, f"Adding {profiles_to_add} new profiles...")
             add_names = new_names[name_idx:]
             add_results = await netflix.add_profiles_parallel(add_names)
             for i, (name, result) in enumerate(zip(add_names, add_results)):
@@ -1252,7 +1280,7 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
         text += "\n".join(results)
         text += f"\n\n{success_count}/{names_count} completed!"
 
-        await msg.edit_text(text)
+        await safe_edit(msg, text)
 
         try:
             screenshot = await netflix.take_profiles_screenshot()
@@ -1267,7 +1295,7 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
     except Exception as e:
         logger.error(f"Update all profiles error: {e}")
         try:
-            await msg.edit_text(f"Error: {str(e)}")
+            await safe_edit(msg, f"Error: {short_error(e)}")
         except:
             pass
 
@@ -1275,15 +1303,15 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
 async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_authorized(user_id):
-        await update.message.reply_text("Not authorized.")
+        await safe_reply(update.message, "Not authorized.")
         return
 
     if user_id not in netflix_sessions:
-        await update.message.reply_text("Login first.")
+        await safe_reply(update.message, "Login first.")
         return
 
     if len(context.args) < 2:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "Usage: /updateallpins pin1 pin2 ... password\n"
             "Example: /updateallpins 1111 2222 3333 4444 5555 MyPass"
         )
@@ -1294,7 +1322,7 @@ async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     for i, pin in enumerate(pins):
         if len(pin) != 4 or not pin.isdigit():
-            await update.message.reply_text(f"PIN #{i+1} '{pin}' invalid. Must be 4 digits.")
+            await safe_reply(update.message, f"PIN #{i+1} '{pin}' invalid. Must be 4 digits.")
             return
 
     msg = await update.message.reply_text("Fetching profiles...")
@@ -1304,7 +1332,7 @@ async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TY
         success, data = await netflix.get_profiles()
 
         if not success:
-            await msg.edit_text(f"Failed: {data}")
+            await safe_edit(msg, f"Failed: {data}")
             return
 
         all_profiles = data.get("profiles", [])
@@ -1312,19 +1340,19 @@ async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TY
         kids_profiles = [p for p in all_profiles if p.get("isKids", False)]
 
         if kids_profiles:
-            await msg.edit_text(
+            await safe_edit(msg, 
                 f"Found {len(all_profiles)} profiles ({len(kids_profiles)} Kids - skipped)\n"
                 f"Setting PINs for {len(regular_profiles)} regular profiles"
             )
 
         if len(pins) != len(regular_profiles):
-            await msg.edit_text(
+            await safe_edit(msg, 
                 f"Got {len(pins)} PINs but {len(regular_profiles)} regular profiles!\n"
                 f"(Kids profiles: {len(kids_profiles)} - skipped)"
             )
             return
 
-        await msg.edit_text(f"Setting {len(regular_profiles)} PINs in PARALLEL...")
+        await safe_edit(msg, f"Setting {len(regular_profiles)} PINs in PARALLEL...")
 
         results = await netflix.set_all_pins_parallel(regular_profiles, pins, password)
 
@@ -1347,7 +1375,7 @@ async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TY
         text += "\n".join(lines)
         text += f"\n\n{success_count}/{len(regular_profiles)} PINs set!"
 
-        await msg.edit_text(text)
+        await safe_edit(msg, text)
 
         try:
             screenshot = await netflix.take_profiles_screenshot()
@@ -1362,7 +1390,7 @@ async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"Update all pins error: {e}")
         try:
-            await msg.edit_text(f"Error: {str(e)}")
+            await safe_edit(msg, f"Error: {short_error(e)}")
         except:
             pass
 
@@ -1370,15 +1398,15 @@ async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def addprofile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_authorized(user_id):
-        await update.message.reply_text("Not authorized.")
+        await safe_reply(update.message, "Not authorized.")
         return
 
     if user_id not in netflix_sessions:
-        await update.message.reply_text("Login first: /login <cookie>")
+        await safe_reply(update.message, "Login first: /login <cookie>")
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /addprofile <name>")
+        await safe_reply(update.message, "Usage: /addprofile <name>")
         return
 
     name = ' '.join(context.args)
@@ -1386,21 +1414,21 @@ async def addprofile_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     netflix = netflix_sessions[user_id]["browser"]
     success, result = await netflix.add_profile(name)
-    await msg.edit_text(f"{'OK' if success else 'FAIL'}: {result}")
+    await safe_edit(msg, f"{'OK' if success else 'FAIL'}: {result}")
 
 
 async def updateprofile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_authorized(user_id):
-        await update.message.reply_text("Not authorized.")
+        await safe_reply(update.message, "Not authorized.")
         return
 
     if user_id not in netflix_sessions:
-        await update.message.reply_text("Login first: /login <cookie>")
+        await safe_reply(update.message, "Login first: /login <cookie>")
         return
 
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /updateprofile <guid> <name>")
+        await safe_reply(update.message, "Usage: /updateprofile <guid> <name>")
         return
 
     guid = context.args[0]
@@ -1409,21 +1437,21 @@ async def updateprofile_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     netflix = netflix_sessions[user_id]["browser"]
     success, result = await netflix.update_profile(guid, name)
-    await msg.edit_text(f"{'OK' if success else 'FAIL'}: {result}")
+    await safe_edit(msg, f"{'OK' if success else 'FAIL'}: {result}")
 
 
 async def deleteprofile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_authorized(user_id):
-        await update.message.reply_text("Not authorized.")
+        await safe_reply(update.message, "Not authorized.")
         return
 
     if user_id not in netflix_sessions:
-        await update.message.reply_text("Login first: /login <cookie>")
+        await safe_reply(update.message, "Login first: /login <cookie>")
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /deleteprofile <guid>")
+        await safe_reply(update.message, "Usage: /deleteprofile <guid>")
         return
 
     guid = context.args[0]
@@ -1431,44 +1459,44 @@ async def deleteprofile_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     netflix = netflix_sessions[user_id]["browser"]
     success, result = await netflix.delete_profile(guid)
-    await msg.edit_text(f"{'OK' if success else 'FAIL'}: {result}")
+    await safe_edit(msg, f"{'OK' if success else 'FAIL'}: {result}")
 
 
 async def setpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_authorized(user_id):
-        await update.message.reply_text("Not authorized.")
+        await safe_reply(update.message, "Not authorized.")
         return
 
     if user_id not in netflix_sessions:
-        await update.message.reply_text("Login first: /login <cookie>")
+        await safe_reply(update.message, "Login first: /login <cookie>")
         return
 
     if len(context.args) < 3:
-        await update.message.reply_text("Usage: /setpin <guid> <pin> <password>")
+        await safe_reply(update.message, "Usage: /setpin <guid> <pin> <password>")
         return
 
     guid, pin, password = context.args[0], context.args[1], context.args[2]
 
     if len(pin) != 4 or not pin.isdigit():
-        await update.message.reply_text("PIN must be exactly 4 digits.")
+        await safe_reply(update.message, "PIN must be exactly 4 digits.")
         return
 
     msg = await update.message.reply_text("Setting PIN...")
 
     netflix = netflix_sessions[user_id]["browser"]
     success, result = await netflix.set_profile_pin(guid, pin, password)
-    await msg.edit_text(f"{'OK' if success else 'FAIL'}: {result}")
+    await safe_edit(msg, f"{'OK' if success else 'FAIL'}: {result}")
 
 
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != HOST_USER_ID:
-        await update.message.reply_text("Admin only.")
+        await safe_reply(update.message, "Admin only.")
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /adduser <telegram_id>")
+        await safe_reply(update.message, "Usage: /adduser <telegram_id>")
         return
 
     try:
@@ -1477,7 +1505,7 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM authorized_users WHERE user_id = %s", (new_id,))
         if cur.fetchone():
-            await update.message.reply_text(f"User {new_id} already authorized.")
+            await safe_reply(update.message, f"User {new_id} already authorized.")
             cur.close()
             conn.close()
             return
@@ -1486,28 +1514,28 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         cur.close()
         conn.close()
-        await update.message.reply_text(f"User {new_id} authorized!")
+        await safe_reply(update.message, f"User {new_id} authorized!")
     except ValueError:
-        await update.message.reply_text("Invalid ID. Must be a number.")
+        await safe_reply(update.message, "Invalid ID. Must be a number.")
     except Exception as e:
         logger.error(f"Add user error: {e}")
-        await update.message.reply_text(f"Error: {str(e)}")
+        await safe_reply(update.message, f"Error: {short_error(e)}")
 
 
 async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != HOST_USER_ID:
-        await update.message.reply_text("Admin only.")
+        await safe_reply(update.message, "Admin only.")
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /removeuser <telegram_id>")
+        await safe_reply(update.message, "Usage: /removeuser <telegram_id>")
         return
 
     try:
         remove_id = int(context.args[0])
         if remove_id == HOST_USER_ID:
-            await update.message.reply_text("Can't remove the host user.")
+            await safe_reply(update.message, "Can't remove the host user.")
             return
 
         conn = get_db()
@@ -1520,20 +1548,20 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if deleted > 0:
             netflix_sessions.pop(remove_id, None)
-            await update.message.reply_text(f"User {remove_id} removed.")
+            await safe_reply(update.message, f"User {remove_id} removed.")
         else:
-            await update.message.reply_text(f"User {remove_id} not found.")
+            await safe_reply(update.message, f"User {remove_id} not found.")
     except ValueError:
-        await update.message.reply_text("Invalid ID. Must be a number.")
+        await safe_reply(update.message, "Invalid ID. Must be a number.")
     except Exception as e:
         logger.error(f"Remove user error: {e}")
-        await update.message.reply_text(f"Error: {str(e)}")
+        await safe_reply(update.message, f"Error: {short_error(e)}")
 
 
 async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != HOST_USER_ID:
-        await update.message.reply_text("Admin only.")
+        await safe_reply(update.message, "Admin only.")
         return
 
     try:
@@ -1549,10 +1577,10 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "*Authorized Users:*\n" + "\n".join([f"- `{u['user_id']}`" for u in users])
         else:
             msg += "No other authorized users."
-        await update.message.reply_text(msg, parse_mode='Markdown')
+        await safe_reply(update.message, msg, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"List users error: {e}")
-        await update.message.reply_text(f"Error: {str(e)}")
+        await safe_reply(update.message, f"Error: {short_error(e)}")
 
 
 async def main():
