@@ -24,11 +24,11 @@ netflix_sessions: Dict[int, dict] = {}
 
 MAX_TG_MSG = 4000
 
-async def safe_edit(msg, text: str):
+async def safe_edit(msg, text: str, **kwargs):
     if len(text) > MAX_TG_MSG:
-        text = text[:MAX_TG_MSG] + "\n...(truncated)"
+        text = text[:MAX_TG_MSG - 20] + "\n...(truncated)"
     try:
-        await msg.edit_text(text)
+        await msg.edit_text(text, **kwargs)
     except Exception as e:
         logger.error(f"Failed to edit message: {e}")
         try:
@@ -36,11 +36,11 @@ async def safe_edit(msg, text: str):
         except:
             pass
 
-async def safe_reply(message, text: str):
+async def safe_reply(message, text: str, **kwargs):
     if len(text) > MAX_TG_MSG:
-        text = text[:MAX_TG_MSG] + "\n...(truncated)"
+        text = text[:MAX_TG_MSG - 20] + "\n...(truncated)"
     try:
-        await message.reply_text(text)
+        await message.reply_text(text, **kwargs)
     except Exception as e:
         logger.error(f"Failed to reply: {e}")
 
