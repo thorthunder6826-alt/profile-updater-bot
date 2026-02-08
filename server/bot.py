@@ -800,57 +800,53 @@ class NetflixBrowser:
             if wrong_pwd > 0:
                 return {"index": index, "success": False, "error": "Incorrect password"}
 
-            logger.info(f"[{index}] Step 6: Looking for PIN digit inputs on page: {page.url}")
+            logger.info(f"[{index}] Step 6: Looking for PIN inputs on page: {page.url}")
 
-            pin_digits = []
+            pin_filled = False
             for attempt in range(10):
-                pin_digit_selectors = [
-                    "input[inputmode='numeric']",
-                    "input[maxlength='1']",
-                    "input[data-uia*='pin']",
-                    "input[name*='pin']",
-                    "input[type='tel']",
-                    "input[type='number']",
-                    "input[pattern='[0-9]*']",
-                ]
-                for selector in pin_digit_selectors:
-                    found = await page.locator(selector + ":visible").all()
-                    if len(found) >= 4:
-                        pin_digits = found[:4]
-                        logger.info(f"[{index}] Found {len(found)} PIN digit inputs: {selector}")
-                        break
-                if pin_digits:
+                main_pin = page.locator("input[name='PIN']:visible").first
+                if await main_pin.count() > 0:
+                    logger.info(f"[{index}] Found main PIN input (name=PIN), filling with {pin}")
+                    await main_pin.click()
+                    await main_pin.press("Control+a")
+                    await main_pin.fill(pin)
+                    pin_filled = True
                     break
 
-                single_pin = page.locator("input[maxlength='4']:visible").first
-                if await single_pin.count() > 0:
-                    logger.info(f"[{index}] Found single PIN input (maxlength=4)")
-                    await single_pin.click()
-                    await single_pin.fill(pin)
-                    pin_digits = None
+                pin_input_numeric = page.locator("input[inputmode='numeric']:visible").first
+                if await pin_input_numeric.count() > 0:
+                    logger.info(f"[{index}] Found numeric PIN input, filling with {pin}")
+                    await pin_input_numeric.click()
+                    await pin_input_numeric.press("Control+a")
+                    await pin_input_numeric.fill(pin)
+                    pin_filled = True
+                    break
+
+                text_inputs = await page.locator("input[type='text']:visible").all()
+                non_search = [inp for inp in text_inputs]
+                if len(non_search) >= 4:
+                    logger.info(f"[{index}] Found {len(non_search)} text inputs, trying as digit inputs")
+                    for i in range(min(4, len(pin))):
+                        digit = pin[i]
+                        await non_search[i].click()
+                        await non_search[i].fill(digit)
+                        await page.wait_for_timeout(50)
+                    pin_filled = True
                     break
 
                 await page.wait_for_timeout(1000)
 
-            if pin_digits is None:
-                pass
-            elif len(pin_digits) >= 4:
-                for i, digit_input in enumerate(pin_digits[:4]):
-                    digit = pin[i] if i < len(pin) else "0"
-                    await digit_input.click()
-                    await digit_input.fill(digit)
-                    await page.wait_for_timeout(100)
-                logger.info(f"[{index}] Step 7: Entered PIN digits: {pin}")
-            else:
+            if not pin_filled:
                 all_inputs = await page.locator("input:visible").all()
-                logger.info(f"[{index}] PIN digits not found. Visible inputs: {len(all_inputs)}")
+                logger.info(f"[{index}] PIN inputs not found. Visible inputs: {len(all_inputs)}")
                 for i, inp in enumerate(all_inputs):
                     inp_type = await inp.get_attribute("type") or ""
                     inp_name = await inp.get_attribute("name") or ""
-                    inp_maxlen = await inp.get_attribute("maxlength") or ""
                     inp_mode = await inp.get_attribute("inputmode") or ""
-                    logger.info(f"[{index}] input[{i}]: type={inp_type} name={inp_name} maxlen={inp_maxlen} inputmode={inp_mode}")
-                return {"index": index, "success": False, "error": "PIN digit inputs not found"}
+                    logger.info(f"[{index}] input[{i}]: type={inp_type} name={inp_name} inputmode={inp_mode}")
+                return {"index": index, "success": False, "error": "PIN inputs not found"}
+
+            logger.info(f"[{index}] Step 7: PIN entered: {pin}")
 
             await page.wait_for_timeout(500)
 
