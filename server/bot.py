@@ -1393,12 +1393,14 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
         regular_profiles = [p for p in profiles if not p.get("isKids", False)]
         kids_count = len(kids_profiles)
 
-        need_to_add = names_count > existing_count
+        missing_count = max(0, names_count - existing_count)
 
         info_text = f"Found {existing_count} profiles"
         if kids_count > 0:
             info_text += f" ({kids_count} Kids)"
         info_text += f"\nNames to set: {names_count}"
+        if missing_count > 0:
+            info_text += f"\nWill add {missing_count} missing profile(s)"
         await safe_edit(msg, info_text)
         await asyncio.sleep(1)
 
