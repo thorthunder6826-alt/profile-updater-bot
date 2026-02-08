@@ -42,13 +42,14 @@ A Telegram bot that automates Netflix profile management using Playwright browse
 
 ## Technical Notes
 - Chromium launched with `--no-sandbox`, `--disable-dev-shm-usage`, `--disable-gpu` flags for Replit environment
-- Per-task timeout: 60s for profile update, 90s for PIN set
 - Netflix selectors use multiple fallback patterns for robustness
 - Browser lifecycle centralized via `_launch_browser()` and `_safe_close()` methods
 - Profile data fetched via HTTP (httpx) for speed; browser automation only for mutations
-- **Parallel processing**: Profile updates and PIN sets run in parallel using separate browser instances (5 profiles in ~20s for renames, ~16s for PINs)
-- **PIN parallelism**: PINs split across up to 3 parallel browser workers, each handling a subset sequentially
-- **MFA handling**: PIN changes accept password via MFA; profile name edits on locked profiles trigger MFA without password option, so the bot uses a **delete+recreate fallback** (deletes old profile, creates new one with desired name) - recreates also run in parallel
+- **CRITICAL: Never use `asyncio.wait_for()` around Playwright page operations** - it creates task cancellation pressure that disrupts Playwright's internal event loop, causing MFA dialogs to fail silently. Call `_do_set_pin()` directly instead.
+- **Parallel processing**: Profile updates and PIN sets run in parallel using separate browser instances (5 profiles in ~20s for renames, ~42s for PINs)
+- **PIN parallelism**: Max 2 concurrent browser workers with 2-second stagger between launches, controlled by asyncio.Semaphore
+- **MFA handling**: PIN changes require password via MFA dialog - click "Edit PIN" → "Confirm password" (force=True) → fill password → submit → fill PIN → save. Entire flow retries up to 3 times if MFA dialog doesn't render.
+- **Profile rename MFA**: Profile name edits on locked profiles trigger MFA without password option, so the bot uses a **delete+recreate fallback** (deletes old profile, creates new one with desired name) - recreates also run in parallel
 - **Smart waiting**: Uses polling (250-500ms intervals) instead of fixed delays for faster operations
 
 ## Running
