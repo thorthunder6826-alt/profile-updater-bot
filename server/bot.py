@@ -25,6 +25,9 @@ pending_email_codes: Dict[int, asyncio.Future] = {}
 
 MAX_TG_MSG = 4000
 
+_last_edit_times: Dict[int, float] = {}
+EDIT_THROTTLE_SECS = 1.5
+
 async def safe_edit(msg, text: str, **kwargs):
     if len(text) > MAX_TG_MSG:
         text = text[:MAX_TG_MSG - 20] + "\n...(truncated)"
@@ -36,6 +39,17 @@ async def safe_edit(msg, text: str, **kwargs):
             await msg.edit_text(text[:500])
         except:
             pass
+
+import time as _time
+
+async def throttled_edit(msg, text: str, force: bool = False, **kwargs):
+    msg_id = msg.message_id if hasattr(msg, 'message_id') else id(msg)
+    now = _time.monotonic()
+    last = _last_edit_times.get(msg_id, 0)
+    if not force and (now - last) < EDIT_THROTTLE_SECS:
+        return
+    _last_edit_times[msg_id] = now
+    await safe_edit(msg, text, **kwargs)
 
 async def safe_reply(message, text: str, **kwargs):
     if len(text) > MAX_TG_MSG:
@@ -447,6 +461,60 @@ class NetflixBrowser:
         logger.error(f"[{index}] MFA: timed out")
         return False
 
+    async def _handle_in_page_mfa(self, page: Page, password: str, index: int) -> str:
+        pwd_input = page.locator("input[type='password']:visible, input[name='challengePassword']:visible").first
+        if await pwd_input.count() > 0:
+            logger.info(f"[{index}] In-page MFA: found password input")
+            await pwd_input.fill(password)
+            for s in ["button:has-text('Submit')", "button[type='submit']", "button:has-text('Continue')"]:
+                btn = page.locator(s).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(force=True)
+                    logger.info(f"[{index}] In-page MFA: clicked {s}")
+                    break
+            await page.wait_for_timeout(2000)
+            wrong = await page.locator("text=Incorrect password").count() + \
+                    await page.locator("text=Wrong password").count()
+            if wrong > 0:
+                logger.error(f"[{index}] In-page MFA: incorrect password")
+                return "failed"
+            return "handled"
+
+        confirm_btn = page.locator("button:has-text('Confirm password')").first
+        if await confirm_btn.count() > 0 and await confirm_btn.is_visible():
+            logger.info(f"[{index}] In-page MFA: clicking 'Confirm password'")
+            await confirm_btn.click(force=True)
+            await page.wait_for_timeout(2000)
+
+            err = await page.locator("text=something went wrong").count() + \
+                  await page.locator("text=trouble with your request").count()
+            if err > 0:
+                logger.warning(f"[{index}] In-page MFA: 'something went wrong' error")
+                return "failed"
+
+            pwd2 = page.locator("input[type='password']:visible, input[name='challengePassword']:visible").first
+            if await pwd2.count() > 0:
+                await pwd2.fill(password)
+                for s in ["button:has-text('Submit')", "button[type='submit']", "button:has-text('Continue')"]:
+                    btn = page.locator(s).first
+                    if await btn.count() > 0 and await btn.is_visible():
+                        await btn.click(force=True)
+                        break
+                await page.wait_for_timeout(2000)
+                wrong = await page.locator("text=Incorrect password").count() + \
+                        await page.locator("text=Wrong password").count()
+                if wrong > 0:
+                    return "failed"
+                return "handled"
+            return "handled"
+
+        mfa_overlay = page.locator("[class*='mfa'], [class*='challenge'], [data-uia*='challenge']").first
+        if await mfa_overlay.count() > 0 and await mfa_overlay.is_visible():
+            logger.info(f"[{index}] In-page MFA: detected MFA overlay element")
+            return "failed"
+
+        return "none"
+
     async def _click_name_link(self, page: Page, old_name: str, index: int) -> bool:
         edit_selectors = [
             "a:has-text('Edit personal')",
@@ -548,11 +616,22 @@ class NetflixBrowser:
             return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
 
         if "/mfa" in page.url.lower():
-            logger.info(f"[{index}] MFA triggered for profile edit - using delete+recreate fallback")
-            return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
+            mfa_ok = await self._handle_mfa_if_needed(page, password, settings_url, index)
+            if not mfa_ok:
+                logger.info(f"[{index}] MFA triggered for profile edit - using delete+recreate fallback")
+                return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
+            clicked_name = await self._click_name_link(page, old_name, index)
+            if not clicked_name:
+                return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
 
         if "/browse" in page.url.lower():
             logger.warning(f"[{index}] Redirected to browse after clicking name, falling back to recreate")
+            return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
+
+        await page.wait_for_timeout(1000)
+
+        in_page_mfa = await self._handle_in_page_mfa(page, password, index)
+        if in_page_mfa == "failed":
             return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
 
         name_input = None
@@ -560,6 +639,12 @@ class NetflixBrowser:
             name_input = await self._try_find_name_input(page, index)
             if name_input:
                 break
+
+            mfa_check = await self._handle_in_page_mfa(page, password, index)
+            if mfa_check == "handled":
+                await page.wait_for_timeout(1000)
+                continue
+
             await page.wait_for_timeout(300)
 
         if name_input is None:
@@ -668,7 +753,7 @@ class NetflixBrowser:
             await asyncio.sleep(delay)
         return await self._update_single_profile(guid, new_name, password, index)
 
-    async def update_all_profiles_parallel(self, profiles: List[dict], new_names: List[str], password: str) -> List[dict]:
+    async def update_all_profiles_parallel(self, profiles: List[dict], new_names: List[str], password: str, progress_callback=None) -> List[dict]:
         tasks = []
         for i, (profile, new_name) in enumerate(zip(profiles, new_names)):
             guid = profile.get("guid", "")
@@ -684,16 +769,25 @@ class NetflixBrowser:
         results = [None] * len(profiles)
         mfa_tasks = []
         for i, r in enumerate(raw_results):
+            old_name = profiles[i].get("profileName", "Unknown")
             if isinstance(r, Exception):
                 results[i] = {"index": i, "success": False, "error": str(r)}
+                if progress_callback:
+                    await progress_callback(i, old_name, new_names[i], False, str(r))
             elif isinstance(r, dict) and r.get("needs_recreate"):
                 profile = profiles[i]
                 mfa_tasks.append((i, self._recreate_profile(
-                    profile.get("guid", ""), profile.get("profileName", "Unknown"), new_names[i], i
+                    profile.get("guid", ""), old_name, new_names[i], i
                 )))
                 results[i] = r
+                if progress_callback:
+                    await progress_callback(i, old_name, new_names[i], None, "MFA blocked - recreating...")
             else:
                 results[i] = r if isinstance(r, dict) else {"index": i, "success": False, "error": str(r)}
+                success = isinstance(r, dict) and r.get("success", False)
+                if progress_callback:
+                    err = r.get("error", "Failed") if isinstance(r, dict) and not success else None
+                    await progress_callback(i, old_name, new_names[i], success, err)
 
         if mfa_tasks:
             logger.info(f"Recreating {len(mfa_tasks)} MFA-blocked profiles in parallel...")
@@ -701,10 +795,19 @@ class NetflixBrowser:
                 *[task for _, task in mfa_tasks], return_exceptions=True
             )
             for (idx, _), recreate_r in zip(mfa_tasks, recreate_results):
+                old_name = profiles[idx].get("profileName", "Unknown")
                 if isinstance(recreate_r, Exception):
                     results[idx] = {"index": idx, "success": False, "error": str(recreate_r)}
+                    if progress_callback:
+                        await progress_callback(idx, old_name, new_names[idx], False, str(recreate_r))
                 elif isinstance(recreate_r, dict):
                     results[idx] = recreate_r
+                    recreate_r["recreated"] = True
+                    success = recreate_r.get("success", False)
+                    if progress_callback:
+                        err = recreate_r.get("error") if not success else None
+                        label = "Recreated" if success else None
+                        await progress_callback(idx, old_name, new_names[idx], success, err, label=label)
 
         return results
 
@@ -1040,7 +1143,7 @@ class NetflixBrowser:
             await self._safe_close(p, browser)
             return {"index": index, "success": False, "error": str(e)}
 
-    async def set_all_pins_parallel(self, profiles: List[dict], pins: List[str], password: str, code_callback=None) -> List[dict]:
+    async def set_all_pins_parallel(self, profiles: List[dict], pins: List[str], password: str, code_callback=None, progress_callback=None) -> List[dict]:
         items = []
         for i, (profile, pin) in enumerate(zip(profiles, pins)):
             guid = profile.get("guid", "")
@@ -1060,6 +1163,11 @@ class NetflixBrowser:
             r = await self._set_pin_individual(idx, guid, pin, password, code_callback=code_callback)
             if isinstance(r, dict) and "index" in r:
                 results[r["index"]] = r
+                if progress_callback:
+                    name = profiles[idx].get("profileName", "Unknown")
+                    success = r.get("success", False)
+                    error = r.get("error") if not success else None
+                    await progress_callback(idx, name, pin, success, error)
 
         failed = [(idx, guid, pin) for idx, guid, pin in items if results[idx] and not results[idx].get("success")]
         if failed:
@@ -1069,6 +1177,9 @@ class NetflixBrowser:
                 r = await self._set_pin_individual(idx, guid, pin, password, code_callback=code_callback)
                 if isinstance(r, dict) and r.get("success"):
                     results[r["index"]] = r
+                    if progress_callback:
+                        name = profiles[idx].get("profileName", "Unknown")
+                        await progress_callback(idx, name, pin, True, None, label="Retry")
                 await asyncio.sleep(2)
 
         for i in range(len(profiles)):
@@ -1562,19 +1673,45 @@ async def updateallprofiles_command(update: Update, context: ContextTypes.DEFAUL
 
         regular_to_update = min(len(regular_profiles), names_count)
         if regular_to_update > 0:
-            await safe_edit(msg, f"Updating {regular_to_update} profiles (MFA-blocked ones will be recreated)...")
+            progress_lines = [""] * regular_to_update
+            for i in range(regular_to_update):
+                progress_lines[i] = f"... {i+1}. {regular_profiles[i].get('profileName', '?')} -> {new_names[i]}"
+
+            async def build_progress_text():
+                header = f"Updating {regular_to_update} profiles:\n\n"
+                return header + "\n".join(progress_lines)
+
+            await safe_edit(msg, await build_progress_text())
+
+            async def on_progress(idx, old_name, new_name, success, error, label=None):
+                if success is None:
+                    progress_lines[idx] = f"... {idx+1}. {old_name} -> {new_name} (recreating...)"
+                elif success:
+                    tag = f" [{label}]" if label else ""
+                    progress_lines[idx] = f"OK {idx+1}. {old_name} -> {new_name}{tag}"
+                else:
+                    progress_lines[idx] = f"FAIL {idx+1}. {old_name} -> {new_name} ({error})"
+                try:
+                    await throttled_edit(msg, await build_progress_text())
+                except:
+                    pass
 
             update_profiles = regular_profiles[:regular_to_update]
             update_names = new_names[:regular_to_update]
-            update_results = await netflix.update_all_profiles_parallel(update_profiles, update_names, password)
+            update_results = await netflix.update_all_profiles_parallel(update_profiles, update_names, password, progress_callback=on_progress)
+
+            await throttled_edit(msg, await build_progress_text(), force=True)
 
             for i, (profile, result) in enumerate(zip(update_profiles, update_results)):
                 old_name = profile.get("profileName", "Unknown")
                 new_name = update_names[i]
                 if isinstance(result, dict) and result.get("success"):
-                    results.append(f"OK {i+1}. {old_name} -> {new_name}")
+                    tag = " [Recreated]" if result.get("recreated") else ""
+                    results.append(f"OK {i+1}. {old_name} -> {new_name}{tag}")
                 else:
                     error = result.get("error", "Failed") if isinstance(result, dict) else str(result)
+                    if error == "MFA_BLOCKED":
+                        error = "MFA blocked"
                     results.append(f"FAIL {i+1}. {old_name} -> {new_name} ({error})")
 
             name_idx = regular_to_update
@@ -1700,11 +1837,32 @@ async def updateallpins_command(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        await safe_edit(msg, f"Setting PINs for {len(regular_profiles)} profiles...")
+        pin_progress = [""] * len(regular_profiles)
+        for i, profile in enumerate(regular_profiles):
+            pin_progress[i] = f"... {i+1}. {profile.get('profileName', '?')} -> PIN: {pins[i]}"
+
+        async def build_pin_progress():
+            header = f"Setting PINs for {len(regular_profiles)} profiles:\n\n"
+            return header + "\n".join(pin_progress)
+
+        await safe_edit(msg, await build_pin_progress())
+
+        async def on_pin_progress(idx, name, pin, success, error, label=None):
+            if success:
+                tag = f" [{label}]" if label else ""
+                pin_progress[idx] = f"OK {idx+1}. {name} -> PIN: {pin}{tag}"
+            else:
+                pin_progress[idx] = f"FAIL {idx+1}. {name} ({error})"
+            try:
+                await throttled_edit(msg, await build_pin_progress())
+            except:
+                pass
 
         chat_id = update.effective_chat.id
         code_callback = make_email_code_callback(chat_id, context.bot)
-        results = await netflix.set_all_pins_parallel(regular_profiles, pins, password, code_callback=code_callback)
+        results = await netflix.set_all_pins_parallel(regular_profiles, pins, password, code_callback=code_callback, progress_callback=on_pin_progress)
+
+        await throttled_edit(msg, await build_pin_progress(), force=True)
 
         lines = []
         for i, (profile, result) in enumerate(zip(regular_profiles, results)):
