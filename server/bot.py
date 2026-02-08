@@ -396,28 +396,100 @@ class NetflixBrowser:
 
         try:
             await page.goto(
-                f"https://www.netflix.com/settings/manage/profile/{guid}",
+                "https://www.netflix.com/ManageProfiles",
                 wait_until="domcontentloaded",
-                timeout=15000
+                timeout=20000
             )
-        except Exception:
-            logger.info(f"[{index}] /settings/manage/profile/ failed, trying /settings/")
-            try:
-                await page.goto(
-                    f"https://www.netflix.com/settings/{guid}",
-                    wait_until="domcontentloaded",
-                    timeout=15000
-                )
-            except Exception as nav_err:
-                return {"index": index, "success": False, "error": f"Navigation failed: {nav_err}"}
+        except Exception as nav_err:
+            return {"index": index, "success": False, "error": f"Navigation failed: {short_error(nav_err)}"}
 
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(3000)
 
         if "login" in page.url.lower():
             return {"index": index, "success": False, "error": "Session expired"}
 
-        all_inputs = await page.locator("input:visible").all()
-        logger.info(f"[{index}] Page URL: {page.url}, visible inputs: {len(all_inputs)}")
+        logger.info(f"[{index}] On ManageProfiles page: {page.url}")
+
+        profile_link = None
+        old_name = None
+        for p in self.profiles_cache:
+            if p.get("guid") == guid:
+                old_name = p.get("profileName", "")
+                break
+
+        edit_pencil_selectors = [
+            f"a[href*='{guid}']",
+            f"[data-profile-guid='{guid}']",
+            f"button[data-profile-guid='{guid}']",
+        ]
+        for selector in edit_pencil_selectors:
+            el = page.locator(selector).first
+            if await el.count() > 0:
+                await el.click(force=True)
+                profile_link = el
+                logger.info(f"[{index}] Clicked profile link by guid: {selector}")
+                break
+
+        if profile_link is None and old_name:
+            profile_containers = await page.locator(".profile-button, [class*='profile'], li[class*='profile'], div[class*='profile-icon']").all()
+            logger.info(f"[{index}] Found {len(profile_containers)} profile containers")
+
+            for container in profile_containers:
+                text = await container.inner_text()
+                if old_name.lower() in text.lower():
+                    edit_btn = container.locator("a, button, [role='button']").first
+                    if await edit_btn.count() > 0:
+                        await edit_btn.click(force=True)
+                        profile_link = edit_btn
+                        logger.info(f"[{index}] Clicked profile container for '{old_name}'")
+                        break
+                    else:
+                        await container.click(force=True)
+                        profile_link = container
+                        logger.info(f"[{index}] Clicked profile directly for '{old_name}'")
+                        break
+
+        if profile_link is None and old_name:
+            name_el = page.locator(f"text='{old_name}'").first
+            if await name_el.count() > 0:
+                parent = name_el.locator("..")
+                link = parent.locator("a, button").first
+                if await link.count() > 0:
+                    await link.click(force=True)
+                    profile_link = link
+                    logger.info(f"[{index}] Clicked link near profile name '{old_name}'")
+                else:
+                    await name_el.click(force=True)
+                    profile_link = name_el
+                    logger.info(f"[{index}] Clicked profile name text '{old_name}'")
+
+        if profile_link is None:
+            all_profile_links = await page.locator("a[href*='profile'], a[href*='Profile']").all()
+            logger.info(f"[{index}] Found {len(all_profile_links)} profile links")
+            if self.profiles_cache:
+                profile_idx = None
+                for pi, p in enumerate(self.profiles_cache):
+                    if p.get("guid") == guid:
+                        profile_idx = pi
+                        break
+                if profile_idx is not None:
+                    edit_links = await page.locator(".profile-button a, [class*='profile'] a[href*='edit'], [class*='profile'] a").all()
+                    if profile_idx < len(edit_links):
+                        await edit_links[profile_idx].click(force=True)
+                        profile_link = edit_links[profile_idx]
+                        logger.info(f"[{index}] Clicked profile by index {profile_idx}")
+
+        if profile_link is None:
+            html_snippet = await page.content()
+            html_short = html_snippet[:2000]
+            logger.error(f"[{index}] Could not find profile {guid} on ManageProfiles page. HTML: {html_short}")
+            return {"index": index, "success": False, "error": f"Could not find profile on ManageProfiles page"}
+
+        await page.wait_for_timeout(3000)
+        logger.info(f"[{index}] After clicking profile, URL: {page.url}")
+
+        if "NotFound" in page.url or "notfound" in page.url.lower():
+            return {"index": index, "success": False, "error": "Profile page not found after click"}
 
         name_selectors = [
             "input[data-uia='profile-name-entry']",
@@ -427,42 +499,29 @@ class NetflixBrowser:
             "input[id*='profile-name']",
             "input[class*='profile-name']",
             "input[placeholder*='Name']",
+            "input[type='text']",
         ]
 
         name_input = None
-        for selector in name_selectors:
-            el = page.locator(selector).first
-            if await el.count() > 0:
-                name_input = el
-                logger.info(f"[{index}] Found name input: {selector}")
-                break
-
-        if name_input is None:
-            edit_btn_selectors = [
-                "button:has-text('Edit')",
-                "a:has-text('Edit')",
-                "[data-uia*='edit']",
-            ]
-            for selector in edit_btn_selectors:
-                el = page.locator(selector).first
-                if await el.count() > 0:
-                    await el.click(force=True)
-                    logger.info(f"[{index}] Clicked edit button: {selector}")
-                    await page.wait_for_timeout(1500)
-                    break
-
+        for _ in range(5):
             for selector in name_selectors:
                 el = page.locator(selector).first
-                if await el.count() > 0:
+                if await el.count() > 0 and await el.is_visible():
                     name_input = el
-                    logger.info(f"[{index}] Found name input after edit click: {selector}")
+                    logger.info(f"[{index}] Found name input: {selector}")
                     break
+            if name_input:
+                break
+            await page.wait_for_timeout(1000)
 
         if name_input is None:
+            all_inputs = await page.locator("input:visible").all()
+            logger.info(f"[{index}] Page URL: {page.url}, visible inputs: {len(all_inputs)}")
             for inp in all_inputs:
                 inp_type = await inp.get_attribute("type") or "text"
                 inp_name = await inp.get_attribute("name") or ""
                 inp_id = await inp.get_attribute("id") or ""
+                logger.info(f"[{index}] Input: type={inp_type} name={inp_name} id={inp_id}")
                 if inp_type in ["text", ""] and "search" not in inp_name.lower():
                     name_input = inp
                     logger.info(f"[{index}] Fallback: using text input name={inp_name} id={inp_id}")
