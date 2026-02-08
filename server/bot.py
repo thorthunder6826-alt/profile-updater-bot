@@ -187,19 +187,47 @@ class NetflixBrowser:
             )
             page = await context.new_page()
 
-            logger.info(f"Navigating to Netflix login page...")
-            await page.goto("https://www.netflix.com/login", wait_until="domcontentloaded")
+            logger.info("Step 1: Navigating to Netflix registration page...")
+            await page.goto("https://www.netflix.com/signup/registration?ref=helpcenter", wait_until="domcontentloaded")
 
             for _ in range(10):
-                if "login" in page.url.lower():
+                if "signup" in page.url.lower() or "registration" in page.url.lower():
                     break
                 await page.wait_for_timeout(500)
 
-            if "login" not in page.url.lower():
-                await cleanup()
-                return False, "Could not reach login page", ""
+            logger.info(f"On page: {page.url}")
 
-            logger.info(f"On login page: {page.url}")
+            logger.info("Step 2: Looking for Sign In link/button...")
+            sign_in_link = None
+            for sel in [
+                "a:has-text('Sign In')",
+                "a:has-text('Sign in')",
+                "a[href*='login']",
+                "header a:has-text('Sign')",
+                "a.login-button",
+            ]:
+                el = page.locator(sel).first
+                try:
+                    if await el.count() > 0:
+                        sign_in_link = el
+                        break
+                except:
+                    pass
+
+            if not sign_in_link:
+                await cleanup()
+                return False, "Could not find 'Sign In' link on registration page", ""
+
+            await sign_in_link.click(force=True, timeout=5000)
+            logger.info("Clicked 'Sign In' link")
+
+            for _ in range(15):
+                url = page.url.lower()
+                if "login" in url:
+                    break
+                await page.wait_for_timeout(300)
+
+            logger.info(f"Step 3: On login page: {page.url}")
 
             email_selectors = [
                 "input[name='userLoginId']",
@@ -208,12 +236,15 @@ class NetflixBrowser:
                 "input[autocomplete='email']",
             ]
             email_input = None
-            for _ in range(10):
+            for _ in range(15):
                 for sel in email_selectors:
                     el = page.locator(sel).first
-                    if await el.count() > 0 and await el.is_visible():
-                        email_input = el
-                        break
+                    try:
+                        if await el.count() > 0:
+                            email_input = el
+                            break
+                    except:
+                        pass
                 if email_input:
                     break
                 await page.wait_for_timeout(300)
@@ -222,29 +253,38 @@ class NetflixBrowser:
                 await cleanup()
                 return False, "Email input not found on login page", ""
 
-            logger.info("Found email input, typing email...")
+            logger.info("Found email input, filling email...")
             await email_input.click(force=True, timeout=5000)
             await email_input.fill(email)
-            await page.wait_for_timeout(300)
-
-            submit_btn = page.locator("button[type='submit']").first
-            if await submit_btn.count() > 0:
-                await submit_btn.click(force=True, timeout=5000)
-                logger.info("Clicked submit/continue button")
 
             pwd_input = None
-            for _ in range(20):
-                for sel in ["input[name='password']", "input[type='password']", "input[autocomplete='current-password']", "input[data-uia='field-password']"]:
-                    el = page.locator(sel).first
-                    try:
-                        if await el.count() > 0:
-                            pwd_input = el
-                            break
-                    except:
-                        pass
-                if pwd_input:
-                    break
-                await page.wait_for_timeout(300)
+            for sel in ["input[name='password']", "input[type='password']", "input[data-uia='field-password']", "input[autocomplete='current-password']"]:
+                el = page.locator(sel).first
+                try:
+                    if await el.count() > 0:
+                        pwd_input = el
+                        break
+                except:
+                    pass
+
+            if not pwd_input:
+                submit_btn = page.locator("button[type='submit']").first
+                if await submit_btn.count() > 0:
+                    await submit_btn.click(force=True, timeout=5000)
+                    logger.info("Two-step login: clicked Next after email")
+
+                for _ in range(20):
+                    for sel in ["input[name='password']", "input[type='password']", "input[data-uia='field-password']", "input[autocomplete='current-password']"]:
+                        el = page.locator(sel).first
+                        try:
+                            if await el.count() > 0:
+                                pwd_input = el
+                                break
+                        except:
+                            pass
+                    if pwd_input:
+                        break
+                    await page.wait_for_timeout(300)
 
             if not pwd_input:
                 error_el = page.locator("[data-uia='error-message-container'], .ui-message-contents").first
@@ -254,18 +294,17 @@ class NetflixBrowser:
                         await cleanup()
                         return False, f"Login error: {err_text}", ""
                 await cleanup()
-                return False, "Password field not found — email may be invalid", ""
+                return False, "Password field not found", ""
 
             logger.info("Found password input, filling password...")
-            await page.wait_for_timeout(500)
             await pwd_input.click(force=True, timeout=5000)
             await pwd_input.fill(password)
-            await page.wait_for_timeout(300)
 
+            logger.info("Step 4: Clicking Sign In button...")
             sign_in_btn = page.locator("button[type='submit']").first
             if await sign_in_btn.count() > 0:
                 await sign_in_btn.click(force=True, timeout=5000)
-                logger.info("Clicked sign-in button")
+                logger.info("Clicked Sign In button")
             else:
                 await page.keyboard.press("Enter")
                 logger.info("Pressed Enter to submit")
