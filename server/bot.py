@@ -394,177 +394,6 @@ class NetflixBrowser:
     async def _do_update_profile(self, page: Page, guid: str, new_name: str, index: int) -> dict:
         logger.info(f"[{index}] Updating profile: {guid} -> {new_name}")
 
-        result = await self._try_api_rename(page, guid, new_name, index)
-        if result:
-            return result
-
-        return await self._try_browser_rename(page, guid, new_name, index)
-
-    async def _try_api_rename(self, page: Page, guid: str, new_name: str, index: int) -> Optional[dict]:
-        try:
-            logger.info(f"[{index}] Trying API-based rename...")
-
-            await page.goto("https://www.netflix.com/browse", wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(3000)
-
-            if "login" in page.url.lower():
-                return {"index": index, "success": False, "error": "Session expired"}
-
-            page_content = await page.content()
-            auth_url = None
-            build_id = None
-
-            auth_patterns = [
-                r'"authURL"\s*:\s*"([^"]+)"',
-                r'authURL["\s:]+([^"&\s]+)',
-            ]
-            for pattern in auth_patterns:
-                match = re.search(pattern, page_content)
-                if match:
-                    auth_url = match.group(1)
-                    break
-
-            if not auth_url:
-                try:
-                    auth_url = await page.evaluate("""
-                        () => {
-                            try {
-                                if (typeof netflix !== 'undefined') {
-                                    return netflix.reactContext?.models?.userInfo?.data?.authURL || null;
-                                }
-                            } catch(e) {}
-                            return null;
-                        }
-                    """)
-                except:
-                    pass
-
-            build_patterns = [
-                r'"BUILD_IDENTIFIER"\s*:\s*"([^"]+)"',
-                r'buildIdentifier"\s*:\s*"([^"]+)"',
-                r'/nf/([a-f0-9]+)/',
-            ]
-            for pattern in build_patterns:
-                match = re.search(pattern, page_content)
-                if match:
-                    build_id = match.group(1)
-                    break
-
-            logger.info(f"[{index}] authURL={'found' if auth_url else 'missing'}, buildId={'found' if build_id else 'missing'}")
-
-            if not auth_url or not build_id:
-                logger.info(f"[{index}] Missing auth data for API rename")
-                return None
-
-            rename_result = await page.evaluate("""
-                async (params) => {
-                    const { guid, newName, authURL, buildId } = params;
-
-                    const endpoints = [
-                        `/api/shakti/${buildId}/profiles/rename`,
-                        `/api/shakti/${buildId}/pathEvaluator`,
-                    ];
-
-                    // Method 1: Try direct profile rename API
-                    try {
-                        const formData = new URLSearchParams();
-                        formData.append('guid', guid);
-                        formData.append('firstName', newName);
-                        formData.append('authURL', authURL);
-
-                        const response = await fetch(`/api/shakti/${buildId}/profiles/rename`, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/x-www-form-urlencoded',
-                            },
-                            body: formData.toString(),
-                            credentials: 'same-origin',
-                        });
-
-                        if (response.ok) {
-                            return { success: true, method: 'rename_api' };
-                        }
-                    } catch (e) {}
-
-                    // Method 2: Try profile update with JSON
-                    try {
-                        const response = await fetch(`/api/shakti/${buildId}/profiles`, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                            },
-                            body: JSON.stringify({
-                                guid: guid,
-                                firstName: newName,
-                                authURL: authURL,
-                            }),
-                            credentials: 'same-origin',
-                        });
-
-                        if (response.ok) {
-                            return { success: true, method: 'profiles_api' };
-                        }
-                    } catch (e) {}
-
-                    // Method 3: Try edit profile form submission
-                    try {
-                        const formData = new URLSearchParams();
-                        formData.append('profileName', newName);
-                        formData.append('guid', guid);
-                        formData.append('authURL', authURL);
-                        formData.append('action', 'update');
-
-                        const response = await fetch(`/ProfilesEditSubmit`, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/x-www-form-urlencoded',
-                            },
-                            body: formData.toString(),
-                            credentials: 'same-origin',
-                        });
-
-                        if (response.ok || response.status === 302) {
-                            return { success: true, method: 'edit_submit' };
-                        }
-                    } catch (e) {}
-
-                    // Method 4: Try the YourAccount profile update
-                    try {
-                        const formData = new URLSearchParams();
-                        formData.append('guid', guid);
-                        formData.append('firstName', newName);
-                        formData.append('authURL', authURL);
-
-                        const response = await fetch(`/settings/profile/edit`, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/x-www-form-urlencoded',
-                            },
-                            body: formData.toString(),
-                            credentials: 'same-origin',
-                        });
-
-                        if (response.ok) {
-                            return { success: true, method: 'settings_edit' };
-                        }
-                    } catch (e) {}
-
-                    return { success: false, error: 'All API methods failed' };
-                }
-            """, {"guid": guid, "newName": new_name, "authURL": auth_url, "buildId": build_id})
-
-            if rename_result and rename_result.get("success"):
-                logger.info(f"[{index}] API rename succeeded via {rename_result.get('method')}")
-                return {"index": index, "success": True, "new_name": new_name}
-            else:
-                logger.info(f"[{index}] API rename failed, falling back to browser")
-                return None
-
-        except Exception as e:
-            logger.info(f"[{index}] API rename error: {short_error(e)}")
-            return None
-
-    async def _try_browser_rename(self, page: Page, guid: str, new_name: str, index: int) -> dict:
         old_name = None
         for p in self.profiles_cache:
             if p.get("guid") == guid:
@@ -572,133 +401,136 @@ class NetflixBrowser:
                 break
 
         try:
-            await page.goto(
-                "https://www.netflix.com/ManageProfiles",
-                wait_until="networkidle",
-                timeout=30000
-            )
+            settings_url = f"https://www.netflix.com/settings/{guid}"
+            logger.info(f"[{index}] Step 1: Navigate to settings page")
+            await page.goto(settings_url, wait_until="networkidle", timeout=30000)
         except Exception:
             try:
-                await page.goto(
-                    "https://www.netflix.com/ManageProfiles",
-                    wait_until="domcontentloaded",
-                    timeout=20000
-                )
+                await page.goto(settings_url, wait_until="domcontentloaded", timeout=20000)
             except Exception as nav_err:
                 return {"index": index, "success": False, "error": f"Navigation failed: {short_error(nav_err)}"}
 
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(3000)
 
         if "login" in page.url.lower():
             return {"index": index, "success": False, "error": "Session expired"}
 
-        logger.info(f"[{index}] On ManageProfiles page: {page.url}")
+        logger.info(f"[{index}] On settings page: {page.url}")
 
-        try:
-            await page.screenshot(path=f"/tmp/debug_manage_{index}.png")
-            html = await page.content()
-            with open(f"/tmp/debug_manage_{index}.html", "w") as f:
-                f.write(html)
-            logger.info(f"[{index}] Saved debug HTML ({len(html)} chars)")
-        except:
-            pass
-
-        profile_idx = None
-        for pi, p in enumerate(self.profiles_cache):
-            if p.get("guid") == guid:
-                profile_idx = pi
-                break
-
-        name_input = await self._try_find_name_input(page, index)
-        if name_input:
-            return await self._fill_and_save(page, name_input, new_name, index)
-
-        pencil_selectors = [
-            "svg[data-name='Pencil']",
-            "[class*='pencil']",
-            "[class*='Pencil']",
-            "[class*='edit-overlay']",
-            "[class*='EditOverlay']",
-            "button[aria-label*='edit' i]",
-            "a[aria-label*='edit' i]",
+        name_link_selectors = [
+            f"a:has-text('{old_name}')" if old_name else None,
+            "a:has-text('Edit personal')",
+            "a:has-text('personal and contact')",
+            "a:has-text('Edit profile')",
         ]
-        for selector in pencil_selectors:
-            els = await page.locator(selector).all()
-            if els:
-                target = profile_idx if profile_idx is not None and profile_idx < len(els) else 0
-                await els[target].click(force=True)
-                logger.info(f"[{index}] Clicked pencil ({selector}) at index {target}")
-                await page.wait_for_timeout(3000)
-                name_input = await self._try_find_name_input(page, index)
-                if name_input:
-                    return await self._fill_and_save(page, name_input, new_name, index)
 
-        link_el = page.locator(f"a[href*='{guid}']").first
-        if await link_el.count() > 0:
-            await link_el.click(force=True)
-            logger.info(f"[{index}] Clicked profile link for guid")
-            await page.wait_for_timeout(5000)
-            logger.info(f"[{index}] After click URL: {page.url}")
-
+        clicked_name = False
+        for selector in name_link_selectors:
+            if not selector:
+                continue
             try:
-                await page.screenshot(path=f"/tmp/debug_settings_{index}.png")
-                html = await page.content()
-                with open(f"/tmp/debug_settings_{index}.html", "w") as f:
-                    f.write(html)
-                logger.info(f"[{index}] Saved settings page HTML ({len(html)} chars)")
-            except:
-                pass
+                el = page.locator(selector).first
+                if await el.count() > 0 and await el.is_visible():
+                    await el.click()
+                    clicked_name = True
+                    logger.info(f"[{index}] Step 2: Clicked name link: {selector}")
+                    break
+            except Exception as e:
+                logger.info(f"[{index}] Selector {selector} failed: {short_error(e)}")
 
-            name_input = await self._try_find_name_input(page, index)
-            if name_input:
-                return await self._fill_and_save(page, name_input, new_name, index)
-
-            all_interactive = await page.locator("button:visible, a:visible, [role='button']:visible").all()
-            logger.info(f"[{index}] Interactive elements on page: {len(all_interactive)}")
-            for i, el in enumerate(all_interactive[:20]):
+        if not clicked_name:
+            all_links = await page.locator("a:visible, button:visible, [role='button']:visible, [role='link']:visible").all()
+            logger.info(f"[{index}] Looking for name link among {len(all_links)} elements")
+            for i, link in enumerate(all_links):
                 text = ""
                 try:
-                    text = (await el.inner_text())[:80]
+                    text = (await link.inner_text()).strip()
                 except:
                     pass
-                logger.info(f"[{index}] element[{i}]: '{text}'")
+                href = await link.get_attribute("href") or ""
+                logger.info(f"[{index}] link[{i}]: text='{text[:80]}' href='{href[:80]}'")
+                if old_name and old_name.lower() in text.lower():
+                    await link.click()
+                    clicked_name = True
+                    logger.info(f"[{index}] Step 2: Clicked element with profile name text at index {i}")
+                    break
+                if "edit personal" in text.lower() or "personal and contact" in text.lower():
+                    await link.click()
+                    clicked_name = True
+                    logger.info(f"[{index}] Step 2: Clicked 'Edit personal' link at index {i}")
+                    break
 
-            all_inputs_any = await page.locator("input, textarea, [contenteditable='true'], [role='textbox']").all()
-            logger.info(f"[{index}] All form elements (visible+hidden): {len(all_inputs_any)}")
-            for i, el in enumerate(all_inputs_any):
-                tag = await el.evaluate("el => el.tagName")
-                t = await el.get_attribute("type") or ""
-                n = await el.get_attribute("name") or ""
-                vis = await el.is_visible()
-                logger.info(f"[{index}] form[{i}]: <{tag}> type={t} name={n} visible={vis}")
+        if not clicked_name:
+            clickable_sections = await page.locator("div[class*='profile'], section, li, [class*='section']").all()
+            for i, sec in enumerate(clickable_sections[:15]):
+                text = ""
+                try:
+                    text = (await sec.inner_text()).strip()
+                except:
+                    pass
+                if old_name and old_name.lower() in text.lower() and "edit" in text.lower():
+                    await sec.click()
+                    clicked_name = True
+                    logger.info(f"[{index}] Step 2: Clicked section with name at index {i}")
+                    break
 
-        return {"index": index, "success": False, "error": f"Could not find edit interface. See debug logs."}
+        if not clicked_name:
+            return {"index": index, "success": False, "error": "Could not find profile name link on settings page"}
 
-    async def _fill_and_save(self, page: Page, name_input, new_name: str, index: int) -> dict:
+        await page.wait_for_timeout(4000)
+        logger.info(f"[{index}] Step 3: On edit page: {page.url}")
+
+        name_input = None
+        for attempt in range(8):
+            name_input = await self._try_find_name_input(page, index)
+            if name_input:
+                break
+            await page.wait_for_timeout(1000)
+
+        if name_input is None:
+            try:
+                await page.screenshot(path=f"/tmp/debug_edit_page_{index}.png")
+                html = await page.content()
+                with open(f"/tmp/debug_edit_page_{index}.html", "w") as f:
+                    f.write(html)
+            except:
+                pass
+            return {"index": index, "success": False, "error": f"Name input not found on edit page {page.url}"}
+
+        logger.info(f"[{index}] Step 4: Editing name to '{new_name}'")
         await name_input.click()
+        await page.wait_for_timeout(200)
         await name_input.press("Control+a")
         await name_input.fill("")
         await page.wait_for_timeout(100)
-        await name_input.type(new_name, delay=20)
+        await name_input.type(new_name, delay=30)
         await page.wait_for_timeout(500)
 
+        current_val = await name_input.input_value()
+        logger.info(f"[{index}] Input value after typing: '{current_val}'")
+
         save_selectors = [
-            "button[data-uia='profile-save-button']",
             "button:has-text('Save')",
-            "button:has-text('Done')",
+            "button[data-uia='profile-save-button']",
             "button[type='submit']",
+            "button:has-text('Done')",
         ]
+
+        save_clicked = False
         for selector in save_selectors:
             el = page.locator(selector).first
-            if await el.count() > 0:
-                await el.click(force=True)
-                logger.info(f"[{index}] Clicked save: {selector}")
+            if await el.count() > 0 and await el.is_visible():
+                await el.click()
+                save_clicked = True
+                logger.info(f"[{index}] Step 5: Clicked save: {selector}")
                 break
-        else:
-            await page.keyboard.press("Enter")
 
-        await page.wait_for_timeout(2000)
-        logger.info(f"[{index}] Profile update completed: {new_name}")
+        if not save_clicked:
+            await page.keyboard.press("Enter")
+            logger.info(f"[{index}] Step 5: Pressed Enter to save")
+
+        await page.wait_for_timeout(3000)
+        logger.info(f"[{index}] Profile update completed: {new_name}, final URL: {page.url}")
         return {"index": index, "success": True, "new_name": new_name}
 
     async def _try_find_name_input(self, page: Page, index: int):
@@ -708,12 +540,12 @@ class NetflixBrowser:
             "input[name='profileName']",
             "input[name='profile-name']",
             "input[id*='profile-name']",
+            "input[id*='profileName']",
             "input[class*='profile-name']",
+            "input[class*='profileName']",
             "input[placeholder*='Name']",
-            "input[type='text']:visible",
-            "input:not([type='hidden']):not([type='password']):not([type='email']):not([type='search']):visible",
-            "[contenteditable='true']",
-            "[role='textbox']",
+            "input[aria-label*='Profile name' i]",
+            "input[aria-label*='name' i]",
         ]
         for selector in selectors:
             try:
@@ -723,6 +555,24 @@ class NetflixBrowser:
                     return el
             except:
                 pass
+
+        visible_text_inputs = await page.locator("input[type='text']:visible, input:not([type]):visible").all()
+        logger.info(f"[{index}] Visible text inputs on page: {len(visible_text_inputs)}")
+        for i, inp in enumerate(visible_text_inputs):
+            inp_type = await inp.get_attribute("type") or ""
+            inp_name = await inp.get_attribute("name") or ""
+            inp_id = await inp.get_attribute("id") or ""
+            inp_val = ""
+            try:
+                inp_val = await inp.input_value()
+            except:
+                pass
+            logger.info(f"[{index}] text input[{i}]: type={inp_type} name={inp_name} id={inp_id} value='{inp_val}'")
+            if inp_type not in ["hidden", "password", "email", "search", "checkbox", "radio"]:
+                if "search" not in inp_name.lower() and "search" not in inp_id.lower():
+                    logger.info(f"[{index}] Using text input[{i}] as name input")
+                    return inp
+
         return None
 
     async def _update_single_profile(self, guid: str, new_name: str, index: int) -> dict:
