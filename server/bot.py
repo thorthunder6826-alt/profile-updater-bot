@@ -568,9 +568,8 @@ class NetflixBrowser:
             await page.wait_for_timeout(300)
 
         if name_input is None:
-            if "/settings/" not in page.url:
-                return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
-            return {"index": index, "success": False, "error": f"Name input not found on {page.url}"}
+            logger.warning(f"[{index}] Name input not found on {page.url}, falling back to recreate")
+            return {"index": index, "success": False, "error": "MFA_BLOCKED", "needs_recreate": True}
 
         logger.info(f"[{index}] Editing name to '{new_name}'")
         await name_input.click()
