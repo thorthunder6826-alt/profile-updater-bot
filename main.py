@@ -1,422 +1,482 @@
+import asyncio
+import email
+import html
+import imaplib
 import logging
 import os
 import re
-import sqlite3
-from datetime import datetime, timezone
-from typing import Optional
+from dataclasses import dataclass
+from email.header import decode_header
+from email.message import Message
+from email.policy import default as default_policy
+from typing import Iterable, Optional, Sequence
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "").strip()
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+GMAIL_IMAP_HOST = os.environ.get("GMAIL_IMAP_HOST", "imap.gmail.com").strip()
+GMAIL_IMAP_PORT = int(os.environ.get("GMAIL_IMAP_PORT", "993"))
+GMAIL_MAILBOX = os.environ.get("GMAIL_MAILBOX", "INBOX").strip()
+FETCH_SCAN_LIMIT = max(1, int(os.environ.get("FETCH_SCAN_LIMIT", "30")))
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0"))
-BOT_DB_PATH = os.environ.get("BOT_DB_PATH", "telegram_bot.db").strip()
 
-TRIGGER_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
-BUILTIN_COMMANDS = {
-    "start",
-    "help",
-    "set",
-    "delete",
-    "list",
-    "request",
-    "myrequests",
-    "openrequests",
-    "close",
-}
+ALLOWED_USER_IDS_RAW = os.environ.get("ALLOWED_USER_IDS", "")
+
+URL_PATTERN = re.compile(r"https?://[^\s<>'\"`]+", re.IGNORECASE)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger("request-bot")
+logger = logging.getLogger("gmail-link-bot")
 
 
-def now_utc() -> str:
-    return datetime.now(tz=timezone.utc).isoformat()
+def parse_allowed_user_ids(raw_value: str) -> set[int]:
+    allowed: set[int] = set()
+    for token in raw_value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            allowed.add(int(token))
+        except ValueError:
+            logger.warning("Skipping invalid ALLOWED_USER_IDS entry: %s", token)
+    return allowed
 
 
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(BOT_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+ALLOWED_USER_IDS = parse_allowed_user_ids(ALLOWED_USER_IDS_RAW)
 
 
-def init_db() -> None:
-    with get_db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS custom_commands (
-                trigger TEXT PRIMARY KEY,
-                response TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                username TEXT,
-                request_text TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'open',
-                admin_note TEXT,
-                created_at TEXT NOT NULL,
-                closed_at TEXT
-            )
-            """
-        )
+def is_authorized(user_id: int) -> bool:
+    if ADMIN_USER_ID != 0 and user_id == ADMIN_USER_ID:
+        return True
+    if ALLOWED_USER_IDS:
+        return user_id in ALLOWED_USER_IDS
+    if ADMIN_USER_ID != 0:
+        return False
+    return True
 
 
-def can_manage(user_id: int) -> bool:
-    # If ADMIN_USER_ID is not configured, every user can manage commands.
-    return ADMIN_USER_ID == 0 or user_id == ADMIN_USER_ID
+async def ensure_authorized(update: Update) -> bool:
+    user = update.effective_user
+    if user is None:
+        return False
+    if is_authorized(user.id):
+        return True
+    if update.message:
+        await update.message.reply_text("You are not authorized to use this bot.")
+    return False
 
 
-def get_custom_response(trigger: str) -> Optional[str]:
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT response FROM custom_commands WHERE trigger = ?",
-            (trigger.lower(),),
-        ).fetchone()
-        return row["response"] if row else None
+def decode_header_value(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    parts: list[str] = []
+    for part, encoding in decode_header(value):
+        if isinstance(part, bytes):
+            try:
+                parts.append(part.decode(encoding or "utf-8", errors="replace"))
+            except LookupError:
+                parts.append(part.decode("utf-8", errors="replace"))
+        else:
+            parts.append(part)
+    return "".join(parts).strip()
+
+
+def decode_part_payload(part: Message) -> str:
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        raw_payload = part.get_payload()
+        return raw_payload if isinstance(raw_payload, str) else ""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except LookupError:
+        return payload.decode("utf-8", errors="replace")
+
+
+def extract_text_bodies(message: Message) -> list[str]:
+    bodies: list[str] = []
+    if message.is_multipart():
+        for part in message.walk():
+            content_type = part.get_content_type()
+            disposition = (part.get("Content-Disposition") or "").lower()
+            if "attachment" in disposition:
+                continue
+            if content_type in {"text/plain", "text/html"}:
+                text = decode_part_payload(part)
+                if text:
+                    bodies.append(text)
+    else:
+        content_type = message.get_content_type()
+        if content_type in {"text/plain", "text/html"}:
+            text = decode_part_payload(message)
+            if text:
+                bodies.append(text)
+    return bodies
+
+
+def normalize_url(candidate: str) -> str:
+    # Email HTML frequently wraps URLs with trailing punctuation.
+    url = html.unescape(candidate.strip())
+    while url and url[-1] in ".,);:!?]>\"'":
+        url = url[:-1]
+    while url and url[0] in "(<\"'":
+        url = url[1:]
+    return url
+
+
+def unique_links(links: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for item in links:
+        normalized = normalize_url(item)
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append(normalized)
+    return output
+
+
+def select_best_link(links: Sequence[str]) -> Optional[str]:
+    if not links:
+        return None
+    high_priority_words = ("verify", "reset", "confirm", "activate", "magic", "login")
+    for link in links:
+        lowered = link.lower()
+        if any(word in lowered for word in high_priority_words):
+            return link
+
+    low_priority_words = ("unsubscribe", "viewinbrowser", "email-preferences")
+    for link in links:
+        lowered = link.lower()
+        if not any(word in lowered for word in low_priority_words):
+            return link
+    return links[0]
+
+
+def extract_links_from_message(message: Message) -> list[str]:
+    bodies = extract_text_bodies(message)
+    raw_links: list[str] = []
+    for body in bodies:
+        raw_links.extend(URL_PATTERN.findall(body))
+    return unique_links(raw_links)
+
+
+@dataclass
+class LinkResult:
+    link: str
+    subject: str
+    from_header: str
+    seen: bool
+
+
+class GmailLinkFetcher:
+    def __init__(
+        self,
+        gmail_address: str,
+        app_password: str,
+        host: str,
+        port: int,
+        mailbox: str,
+        scan_limit: int,
+    ):
+        self.gmail_address = gmail_address
+        self.app_password = app_password
+        self.host = host
+        self.port = port
+        self.mailbox = mailbox
+        self.scan_limit = scan_limit
+
+    def _connect(self) -> imaplib.IMAP4_SSL:
+        client = imaplib.IMAP4_SSL(self.host, self.port, timeout=20)
+        client.login(self.gmail_address, self.app_password)
+        status, _ = client.select(self.mailbox)
+        if status != "OK":
+            raise RuntimeError(f"Could not open mailbox '{self.mailbox}'")
+        return client
+
+    @staticmethod
+    def _build_search_criteria(unseen_only: bool, sender: Optional[str]) -> list[str]:
+        criteria: list[str] = ["UNSEEN" if unseen_only else "ALL"]
+        if sender:
+            criteria.extend(["FROM", f'"{sender}"'])
+        return criteria
+
+    @staticmethod
+    def _decode_message(raw_data: bytes) -> Message:
+        return email.message_from_bytes(raw_data, policy=default_policy)
+
+    @staticmethod
+    def _subject_matches(subject: str, subject_filter: Optional[str]) -> bool:
+        if not subject_filter:
+            return True
+        return subject_filter.lower() in subject.lower()
+
+    def _search(self, client: imaplib.IMAP4_SSL, criteria: list[str]) -> list[bytes]:
+        status, data = client.search(None, *criteria)
+        if status != "OK" or not data:
+            return []
+        if not data[0]:
+            return []
+        ids = data[0].split()
+        if not ids:
+            return []
+        return ids[-self.scan_limit :]
+
+    def _fetch_email_message(
+        self, client: imaplib.IMAP4_SSL, msg_id: bytes
+    ) -> Optional[Message]:
+        status, data = client.fetch(msg_id, "(RFC822)")
+        if status != "OK" or not data:
+            return None
+        for item in data:
+            if isinstance(item, tuple) and len(item) >= 2:
+                payload = item[1]
+                if isinstance(payload, bytes):
+                    return self._decode_message(payload)
+        return None
+
+    def find_latest_link(
+        self,
+        sender: Optional[str] = None,
+        subject_filter: Optional[str] = None,
+    ) -> Optional[LinkResult]:
+        client: Optional[imaplib.IMAP4_SSL] = None
+        try:
+            client = self._connect()
+
+            # Prefer unseen emails first; if not found, fall back to all messages.
+            phases = [True, False]
+            for unseen_only in phases:
+                criteria = self._build_search_criteria(unseen_only, sender)
+                message_ids = self._search(client, criteria)
+                for message_id in reversed(message_ids):
+                    msg = self._fetch_email_message(client, message_id)
+                    if msg is None:
+                        continue
+                    subject = decode_header_value(msg.get("Subject"))
+                    from_header = decode_header_value(msg.get("From"))
+
+                    if not self._subject_matches(subject, subject_filter):
+                        continue
+
+                    links = extract_links_from_message(msg)
+                    best_link = select_best_link(links)
+                    if best_link:
+                        return LinkResult(
+                            link=best_link,
+                            subject=subject or "(no subject)",
+                            from_header=from_header or "(unknown sender)",
+                            seen=not unseen_only,
+                        )
+            return None
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                try:
+                    client.logout()
+                except Exception:
+                    pass
+
+    def check_connection(self) -> tuple[bool, str]:
+        client: Optional[imaplib.IMAP4_SSL] = None
+        try:
+            client = self._connect()
+            status, data = client.search(None, "ALL")
+            if status != "OK":
+                return False, "Connected but mailbox search failed."
+            total = len(data[0].split()) if data and data[0] else 0
+            return True, f"Gmail connected. Mailbox '{self.mailbox}' has {total} emails."
+        except imaplib.IMAP4.error as exc:
+            return False, f"Gmail auth failed: {exc}"
+        except Exception as exc:
+            return False, f"Gmail connection error: {exc}"
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                try:
+                    client.logout()
+                except Exception:
+                    pass
+
+
+FETCHER = GmailLinkFetcher(
+    gmail_address=GMAIL_ADDRESS,
+    app_password=GMAIL_APP_PASSWORD,
+    host=GMAIL_IMAP_HOST,
+    port=GMAIL_IMAP_PORT,
+    mailbox=GMAIL_MAILBOX,
+    scan_limit=FETCH_SCAN_LIMIT,
+)
+
+
+def parse_fetchfrom_args(args: list[str]) -> tuple[Optional[str], Optional[str]]:
+    if not args:
+        return None, None
+    sender = args[0].strip()
+    subject_filter = " ".join(args[1:]).strip() or None
+    return sender or None, subject_filter
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    management_note = (
-        "You can manage commands with /set, /delete, /list.\n"
-        if can_manage(user_id)
-        else "Only admin can manage command templates.\n"
-    )
+    if not await ensure_authorized(update):
+        return
     await update.message.reply_text(
-        "Request Bot is live.\n\n"
-        "Core commands:\n"
-        "/request <text> - Create a request ticket\n"
-        "/myrequests - Show your latest request tickets\n"
-        "/help - Show command usage\n\n"
-        + management_note
-        + "\nType a saved trigger (or /trigger) to receive its configured reply."
+        "Gmail Link Bot is ready.\n\n"
+        "Commands:\n"
+        "/fetchlink [subject keywords] - fetch latest link from your Gmail\n"
+        "/fetchfrom <sender_email> [subject keywords] - fetch latest link from sender\n"
+        "/checkgmail - verify Gmail connection\n"
+        "/help - show usage"
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    lines = [
-        "How to use this bot:",
-        "",
-        "1) Save custom replies (admin):",
-        "/set <trigger> | <response>",
-        "Example: /set pricing | Pricing starts at $29/month.",
-        "",
-        "2) Use custom replies:",
-        "Send: pricing",
-        "or send: /pricing",
-        "",
-        "3) Track requests:",
-        "/request <text>",
-        "/myrequests",
-    ]
-    if can_manage(user_id):
-        lines.extend(
-            [
-                "",
-                "Admin request management:",
-                "/openrequests",
-                "/close <ticket_id> [note]",
-                "/list",
-                "/delete <trigger>",
-            ]
-        )
-    await update.message.reply_text("\n".join(lines))
+    if not await ensure_authorized(update):
+        return
+    await update.message.reply_text(
+        "Usage examples:\n\n"
+        "1) Get latest link (prefer unseen emails):\n"
+        "/fetchlink\n\n"
+        "2) Get latest link with subject filter:\n"
+        "/fetchlink reset password\n\n"
+        "3) Get latest link from specific sender:\n"
+        "/fetchfrom no-reply@example.com verify\n\n"
+        "Setup required env vars:\n"
+        "TELEGRAM_BOT_TOKEN, GMAIL_ADDRESS, GMAIL_APP_PASSWORD"
+    )
 
 
-def parse_set_payload(text: str) -> tuple[Optional[str], Optional[str]]:
-    if "|" not in text:
-        return None, None
-    left, right = text.split("|", 1)
-    trigger = left.strip().lstrip("/").lower()
-    response = right.strip()
-    if not trigger or not response:
-        return None, None
-    return trigger, response
+async def checkgmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    status_message = await update.message.reply_text("Checking Gmail connection...")
+    ok, info = await asyncio.to_thread(FETCHER.check_connection)
+    await status_message.edit_text(("OK: " if ok else "FAIL: ") + info)
 
 
-async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not can_manage(user_id):
-        await update.message.reply_text("Only admin can use /set.")
+async def fetchlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
         return
 
-    raw_text = update.message.text or ""
-    parts = raw_text.split(" ", 1)
-    if len(parts) < 2:
-        await update.message.reply_text("Usage: /set <trigger> | <response>")
-        return
-
-    trigger, response = parse_set_payload(parts[1])
-    if not trigger or not response:
-        await update.message.reply_text("Usage: /set <trigger> | <response>")
-        return
-
-    if trigger in BUILTIN_COMMANDS:
-        await update.message.reply_text(
-            f"'{trigger}' is reserved by a built-in bot command."
-        )
-        return
-
-    if not TRIGGER_PATTERN.match(trigger):
-        await update.message.reply_text(
-            "Invalid trigger. Use lowercase letters, digits, underscores (max 32 chars)."
-        )
-        return
-
-    timestamp = now_utc()
-    with get_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO custom_commands (trigger, response, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(trigger) DO UPDATE SET
-                response = excluded.response,
-                updated_at = excluded.updated_at
-            """,
-            (trigger, response, timestamp, timestamp),
-        )
-
-    await update.message.reply_text(f"Saved /{trigger}.")
-
-
-async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not can_manage(user_id):
-        await update.message.reply_text("Only admin can use /delete.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /delete <trigger>")
-        return
-
-    trigger = context.args[0].lstrip("/").lower()
-    with get_db() as conn:
-        cursor = conn.execute(
-            "DELETE FROM custom_commands WHERE trigger = ?",
-            (trigger,),
-        )
-
-    if cursor.rowcount == 0:
-        await update.message.reply_text(f"No custom command found for '{trigger}'.")
-    else:
-        await update.message.reply_text(f"Deleted /{trigger}.")
-
-
-async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT trigger, updated_at FROM custom_commands ORDER BY trigger ASC"
-        ).fetchall()
-
-    if not rows:
-        await update.message.reply_text("No custom commands saved yet.")
-        return
-
-    lines = ["Saved custom commands:"]
-    for row in rows:
-        lines.append(f"- /{row['trigger']} (updated {row['updated_at']})")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def request_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    request_text = " ".join(context.args).strip()
-    if not request_text:
-        await update.message.reply_text("Usage: /request <text>")
-        return
-
-    user = update.effective_user
-    username = user.username or user.full_name or ""
-    timestamp = now_utc()
-
-    with get_db() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO user_requests (user_id, username, request_text, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (user.id, username, request_text, timestamp),
-        )
-        ticket_id = cursor.lastrowid
-
-    await update.message.reply_text(f"Request ticket #{ticket_id} created.")
-
-    if ADMIN_USER_ID != 0 and user.id != ADMIN_USER_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_USER_ID,
-                text=(
-                    f"New request #{ticket_id}\n"
-                    f"From: {username} ({user.id})\n"
-                    f"Text: {request_text}"
-                ),
-            )
-        except Exception as exc:
-            logger.warning("Failed to forward request #%s to admin: %s", ticket_id, exc)
-
-
-async def myrequests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    with get_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, status, request_text, created_at, closed_at, admin_note
-            FROM user_requests
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT 10
-            """,
-            (user_id,),
-        ).fetchall()
-
-    if not rows:
-        await update.message.reply_text("You have no request tickets yet.")
-        return
-
-    lines = ["Your latest request tickets:"]
-    for row in rows:
-        line = f"#{row['id']} [{row['status']}] {row['request_text']}"
-        if row["status"] == "closed":
-            note = row["admin_note"] or "No note"
-            line += f" | note: {note}"
-        lines.append(line)
-    await update.message.reply_text("\n".join(lines))
-
-
-async def openrequests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not can_manage(update.effective_user.id):
-        await update.message.reply_text("Only admin can use /openrequests.")
-        return
-
-    with get_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, user_id, username, request_text, created_at
-            FROM user_requests
-            WHERE status = 'open'
-            ORDER BY id ASC
-            LIMIT 20
-            """
-        ).fetchall()
-
-    if not rows:
-        await update.message.reply_text("No open request tickets.")
-        return
-
-    lines = ["Open request tickets:"]
-    for row in rows:
-        display_name = row["username"] or "unknown-user"
-        lines.append(
-            f"#{row['id']} from {display_name} ({row['user_id']}): {row['request_text']}"
-        )
-    await update.message.reply_text("\n".join(lines))
-
-
-async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not can_manage(update.effective_user.id):
-        await update.message.reply_text("Only admin can use /close.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /close <ticket_id> [note]")
-        return
+    subject_filter = " ".join(context.args).strip() or None
+    wait_message = await update.message.reply_text("Looking for the latest link...")
 
     try:
-        ticket_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Ticket ID must be a number.")
+        result = await asyncio.to_thread(
+            FETCHER.find_latest_link, None, subject_filter
+        )
+    except imaplib.IMAP4.error as exc:
+        await wait_message.edit_text(f"Gmail auth error: {exc}")
+        return
+    except Exception as exc:
+        await wait_message.edit_text(f"Gmail fetch error: {exc}")
         return
 
-    note = " ".join(context.args[1:]).strip()
-    with get_db() as conn:
-        cursor = conn.execute(
-            """
-            UPDATE user_requests
-            SET status = 'closed', closed_at = ?, admin_note = ?
-            WHERE id = ? AND status = 'open'
-            """,
-            (now_utc(), note, ticket_id),
+    if not result:
+        await wait_message.edit_text(
+            "No email with a link was found for the current filters."
         )
+        return
 
-    if cursor.rowcount == 0:
+    seen_text = "seen" if result.seen else "unseen"
+    await wait_message.edit_text(
+        "Latest link found:\n"
+        f"{result.link}\n\n"
+        f"From: {result.from_header}\n"
+        f"Subject: {result.subject}\n"
+        f"Source: {seen_text} email"
+    )
+
+
+async def fetchfrom_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+
+    sender, subject_filter = parse_fetchfrom_args(context.args)
+    if not sender:
         await update.message.reply_text(
-            f"No open ticket found with ID #{ticket_id}."
+            "Usage: /fetchfrom <sender_email> [subject keywords]"
         )
-    else:
-        await update.message.reply_text(f"Closed ticket #{ticket_id}.")
-
-
-async def custom_or_unknown_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    text = (update.message.text or "").strip()
-    if not text.startswith("/"):
         return
 
-    command_name = text[1:].split()[0].split("@")[0].lower()
-    response = get_custom_response(command_name)
-    if response:
-        await update.message.reply_text(response)
+    wait_message = await update.message.reply_text(
+        f"Looking for latest link from {sender}..."
+    )
+
+    try:
+        result = await asyncio.to_thread(
+            FETCHER.find_latest_link,
+            sender,
+            subject_filter,
+        )
+    except imaplib.IMAP4.error as exc:
+        await wait_message.edit_text(f"Gmail auth error: {exc}")
+        return
+    except Exception as exc:
+        await wait_message.edit_text(f"Gmail fetch error: {exc}")
         return
 
-    await update.message.reply_text("Unknown command. Use /help.")
-
-
-async def plain_text_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (update.message.text or "").strip().lower()
-    if not text:
+    if not result:
+        await wait_message.edit_text(
+            "No link found from that sender with the current filters."
+        )
         return
 
-    response = get_custom_response(text)
-    if response:
-        await update.message.reply_text(response)
+    seen_text = "seen" if result.seen else "unseen"
+    await wait_message.edit_text(
+        "Latest link found:\n"
+        f"{result.link}\n\n"
+        f"From: {result.from_header}\n"
+        f"Subject: {result.subject}\n"
+        f"Source: {seen_text} email"
+    )
+
+
+def validate_configuration() -> list[str]:
+    errors: list[str] = []
+    if not TELEGRAM_BOT_TOKEN:
+        errors.append("Missing TELEGRAM_BOT_TOKEN")
+    if not GMAIL_ADDRESS:
+        errors.append("Missing GMAIL_ADDRESS")
+    if not GMAIL_APP_PASSWORD:
+        errors.append("Missing GMAIL_APP_PASSWORD")
+    return errors
 
 
 def main() -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        logger.error("Missing TELEGRAM_BOT_TOKEN environment variable.")
+    errors = validate_configuration()
+    if errors:
+        for error in errors:
+            logger.error(error)
         return
 
-    if ADMIN_USER_ID == 0:
+    if ADMIN_USER_ID == 0 and not ALLOWED_USER_IDS:
         logger.warning(
-            "ADMIN_USER_ID is not set. All users can manage commands and tickets."
+            "No ADMIN_USER_ID or ALLOWED_USER_IDS configured; bot is open to all users."
         )
-
-    init_db()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("set", set_command))
-    app.add_handler(CommandHandler("delete", delete_command))
-    app.add_handler(CommandHandler("list", list_command))
-    app.add_handler(CommandHandler("request", request_command))
-    app.add_handler(CommandHandler("myrequests", myrequests_command))
-    app.add_handler(CommandHandler("openrequests", openrequests_command))
-    app.add_handler(CommandHandler("close", close_command))
+    app.add_handler(CommandHandler("checkgmail", checkgmail_command))
+    app.add_handler(CommandHandler("fetchlink", fetchlink_command))
+    app.add_handler(CommandHandler("fetchfrom", fetchfrom_command))
 
-    # Command lookup fallback so /custom_trigger works.
-    app.add_handler(MessageHandler(filters.COMMAND, custom_or_unknown_command))
-    # Plain-text lookup so typing "pricing" can also trigger reply.
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text_trigger))
-
-    logger.info("Starting request-driven Telegram bot...")
+    logger.info("Starting Gmail Link Telegram bot...")
     app.run_polling(drop_pending_updates=True)
 
 
