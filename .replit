@@ -1,10 +1,10 @@
-modules = ["nodejs-20", "web", "postgresql-16", "python-3.11"]
+modules = ["nodejs-20", "web"]
 run = "npm run dev"
-hidden = [".config", ".git", "generated-icon.png", "node_modules", "dist"]
+hidden = [".config", ".git", "node_modules", "dist"]
 
 [nix]
 channel = "stable-24_05"
-packages = ["gitFull", "playwright-driver", "nspr", "nss", "xorg.libX11", "xorg.libXcomposite", "xorg.libXdamage", "xorg.libXrandr", "xorg.libXext", "xorg.libXfixes", "xorg.libxcb", "at-spi2-atk", "cups", "libdrm", "mesa", "pango", "cairo", "glib", "dbus", "expat", "alsa-lib", "gtk3", "libxkbcommon"]
+packages = ["gitFull"]
 
 [[ports]]
 localPort = 5000
@@ -38,8 +38,3 @@ author = "agent"
 task = "shell.exec"
 args = "npm run dev"
 waitForPort = 5000
-
-[userenv]
-
-[userenv.shared]
-HOST_USER_ID = "6401011033"
