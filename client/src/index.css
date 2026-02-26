@@ -1,82 +1,102 @@
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  --font-sans: 'Plus Jakarta Sans', sans-serif;
-  --font-mono: 'JetBrains Mono', monospace;
+  --font-sans: 'Inter', 'Amazon Ember', Arial, sans-serif;
+  --font-mono: monospace;
 
-  /* Modern Dark Theme - Netflix Inspired */
-  --background: 0 0% 5%;
-  --foreground: 0 0% 95%;
+  /* Amazon Light Theme */
+  --background: 0 0% 93%;
+  --foreground: 0 0% 7%;
 
-  --card: 0 0% 8%;
-  --card-foreground: 0 0% 95%;
+  --card: 0 0% 100%;
+  --card-foreground: 0 0% 7%;
+  --card-border: 0 0% 85%;
 
-  --popover: 0 0% 8%;
-  --popover-foreground: 0 0% 95%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 0 0% 7%;
+  --popover-border: 0 0% 85%;
 
-  --primary: 357 92% 47%; /* Netflix Red */
-  --primary-foreground: 0 0% 100%;
+  --primary: 36 100% 50%;
+  --primary-foreground: 0 0% 7%;
 
-  --secondary: 0 0% 12%;
-  --secondary-foreground: 0 0% 95%;
+  --secondary: 0 0% 96%;
+  --secondary-foreground: 0 0% 7%;
 
-  --muted: 0 0% 12%;
-  --muted-foreground: 0 0% 60%;
+  --muted: 0 0% 90%;
+  --muted-foreground: 0 0% 40%;
 
-  --accent: 357 92% 47%;
-  --accent-foreground: 0 0% 100%;
+  --accent: 36 100% 50%;
+  --accent-foreground: 0 0% 7%;
 
-  --destructive: 0 62% 30%;
+  --destructive: 0 62% 50%;
   --destructive-foreground: 0 0% 98%;
 
-  --border: 0 0% 15%;
-  --input: 0 0% 15%;
-  --ring: 357 92% 47%;
+  --border: 0 0% 85%;
+  --input: 0 0% 85%;
+  --ring: 36 100% 50%;
 
-  --radius: 0.75rem;
+  --radius: 0.5rem;
+
+  /* Amazon-specific colors */
+  --amazon-navy: 210 29% 15%;
+  --amazon-navy-light: 210 20% 25%;
+  --amazon-orange: 36 100% 50%;
+  --amazon-orange-dark: 28 85% 45%;
+  --amazon-blue: 210 100% 35%;
+  --amazon-star: 42 100% 50%;
+  --amazon-deal: 0 80% 45%;
 }
 
 @layer base {
   body {
-    @apply bg-background text-foreground font-sans antialiased selection:bg-primary/30 selection:text-primary-foreground;
-    background-image: 
-      radial-gradient(circle at 50% 0%, hsl(var(--primary) / 0.15), transparent 40%),
-      linear-gradient(to bottom, transparent, hsl(var(--background)));
+    @apply bg-background text-foreground font-sans antialiased;
+    font-size: 14px;
+    line-height: 1.4;
   }
 
-  /* Custom Scrollbar */
   ::-webkit-scrollbar {
     width: 8px;
     height: 8px;
   }
   ::-webkit-scrollbar-track {
-    @apply bg-transparent;
+    @apply bg-gray-100;
   }
   ::-webkit-scrollbar-thumb {
-    @apply bg-white/10 rounded-full hover:bg-white/20 transition-colors;
+    @apply bg-gray-300 rounded hover:bg-gray-400;
   }
 
-  h1, h2, h3, h4, h5, h6 {
-    @apply tracking-tight font-bold;
+  a {
+    @apply text-[hsl(210,100%,35%)] hover:text-[hsl(28,85%,45%)] hover:underline cursor-pointer;
   }
 }
 
 @layer utilities {
-  .glass-panel {
-    @apply bg-card/60 backdrop-blur-xl border border-white/5 shadow-xl;
+  .amazon-btn {
+    @apply bg-gradient-to-b from-[#f7dfa5] to-[#f0c14b] border border-[#a88734] rounded-sm px-3 py-1.5 text-sm cursor-pointer hover:from-[#f5d78e] hover:to-[#eeb933] active:from-[#f0c14b] active:to-[#f0c14b] shadow-sm;
   }
-  
-  .text-glow {
-    text-shadow: 0 0 20px hsl(var(--primary) / 0.5);
+  .amazon-btn-primary {
+    @apply bg-[#FFD814] hover:bg-[#F7CA00] border border-[#FCD200] rounded-full px-4 py-2 text-sm font-medium cursor-pointer shadow-sm;
   }
-
-  .border-gradient {
-    background: linear-gradient(var(--card), var(--card)) padding-box,
-                linear-gradient(to bottom right, hsl(var(--primary) / 0.5), transparent) border-box;
-    border: 1px solid transparent;
+  .amazon-btn-orange {
+    @apply bg-[#FA8900] hover:bg-[#E47911] text-white border border-[#C45500] rounded-full px-4 py-2 text-sm font-medium cursor-pointer shadow-sm;
+  }
+  .amazon-card {
+    @apply bg-white rounded-sm p-5 shadow-sm;
+  }
+  .amazon-link {
+    @apply text-[#007185] hover:text-[#C7511F] hover:underline cursor-pointer;
+  }
+  .star-color {
+    color: #FFA41C;
+  }
+  .deal-badge {
+    @apply bg-[#CC0C39] text-white text-xs font-bold px-2 py-0.5 rounded-sm;
+  }
+  .prime-blue {
+    color: #007185;
   }
 }
